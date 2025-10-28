@@ -15,8 +15,8 @@ from dotenv import load_dotenv
 # Load environment variables or hardcode for testing
 load_dotenv()
 
-SUPABASE_KEY="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhmcGJneHJkbWhod25tb3Z6b3RtIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1OTEzMjM0NSwiZXhwIjoyMDc0NzA4MzQ1fQ.YnwJuTwV1nFPkDgzTgDKfeqc_IC9oLMH_Tgsphg4N0E"
-SUPABASE_URL="https://hfpbgxrdmhhwnmovzotm.supabase.co"
+SUPABASE_KEY=os.getenv("SUPABASE_KEY")
+SUPABASE_URL=os.getenv("SUPABASE_URL")
 
 supabase: Client = create_client(SUPABASE_URL,SUPABASE_KEY)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")

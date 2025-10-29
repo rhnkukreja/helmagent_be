@@ -36,17 +36,18 @@ app.add_middleware(
 
 # -------------------- Helper Functions --------------------
 
+import json
+from fastapi import HTTPException
+
 def extract_text_from_image(image_bytes: bytes) -> dict:
     """
     Uses GPT-4 Vision to extract structured data (name, contact_number, items_ordered, date, total_amount)
     from an image of a bill or invoice.
-    Returns dict with keys: name, contact_number, items_ordered (list), date (YYYY-MM-DD or ""), total_amount (float or 0.0)
+    Returns dict with keys: name, contact_number, items_ordered (list), date (YYYY-MM-DD), total_amount (float).
     """
     try:
-        import re
-        from datetime import datetime
-
         print("Processing image with GPT-4 Vision...")
+
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
@@ -84,175 +85,22 @@ def extract_text_from_image(image_bytes: bytes) -> dict:
             temperature=0.1,
         )
 
-        raw_output = response.choices[0].message.content
+        raw_output = response.choices[0].message.content.strip()
         print("Raw GPT Output:", raw_output)
 
-        # --- sanitize GPT output from markdown/code fences ---
-        clean_output = raw_output.strip()
-        clean_output = re.sub(r"^```(?:json)?", "", clean_output, flags=re.IGNORECASE)
-        clean_output = re.sub(r"```$", "", clean_output)
-        clean_output = clean_output.strip()
+        # Clean up any markdown-style JSON fences (just in case)
+        if raw_output.startswith("```"):
+            raw_output = raw_output.strip("`")
+            if "json" in raw_output:
+                raw_output = raw_output.replace("json", "", 1).strip()
+        
+        result = json.loads(raw_output)
+        print("Extracted Data:", result)
 
-        # Try to parse JSON directly
-        parsed = {}
-        try:
-            parsed = json.loads(clean_output)
-        except Exception as parse_err:
-            # If direct parse fails, attempt to extract a JSON substring
-            print("json.loads failed, trying to extract JSON substring:", parse_err)
-            match = re.search(r"(\{[\s\S]*\})", clean_output)
-            if match:
-                try:
-                    parsed = json.loads(match.group(1))
-                except Exception as parse_err2:
-                    print("Second json.loads attempt failed:", parse_err2)
-                    parsed = {}
-            else:
-                parsed = {}
-
-        # Ensure keys exist
-        name = parsed.get("name", "") if isinstance(parsed.get("name", ""), str) else ""
-        contact_number = parsed.get("contact_number", "") if isinstance(parsed.get("contact_number", ""), str) else ""
-        items_ordered = parsed.get("items_ordered", []) if isinstance(parsed.get("items_ordered", []), list) else []
-
-        # --- DATE extraction/normalization ---
-        bill_date = ""
-        raw_date_candidates = []
-
-        # 1) prefer parsed date if present
-        if parsed.get("date"):
-            raw_date_candidates.append(str(parsed.get("date")))
-
-        # 2) fallback: try to find date-like tokens in the cleaned output
-        # common date patterns: DD/MM/YYYY, DD-MM-YYYY, YYYY-MM-DD, MMM DD, YYYY, etc.
-        date_patterns = [
-            r"\b(\d{4}-\d{2}-\d{2})\b",
-            r"\b(\d{2}/\d{2}/\d{4})\b",
-            r"\b(\d{2}-\d{2}-\d{4})\b",
-            r"\b(\d{1,2}\s(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?\s?,?\s?\d{4})\b",
-            r"\b(?:on\s)?(\d{1,2}/\d{1,2}/\d{2,4})\b",
-        ]
-        for p in date_patterns:
-            for m in re.findall(p, clean_output, flags=re.IGNORECASE):
-                if m:
-                    raw_date_candidates.append(m)
-
-        # Try to parse candidates with common formats
-        def try_parse_date(s: str):
-            formats = ["%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d/%m/%y", "%d-%m-%y", "%d %b %Y", "%d %B %Y"]
-            for fmt in formats:
-                try:
-                    dt = datetime.strptime(s.strip(), fmt)
-                    return dt.date().isoformat()
-                except Exception:
-                    continue
-            # try a relaxed numeric-only YYYYMMDD
-            s_clean = re.sub(r"[^\d]", "", s)
-            if len(s_clean) == 8:
-                try:
-                    dt = datetime.strptime(s_clean, "%Y%m%d")
-                    return dt.date().isoformat()
-                except Exception:
-                    pass
-            return None
-
-        for candidate in raw_date_candidates:
-            parsed_date = try_parse_date(candidate)
-            if parsed_date:
-                bill_date = parsed_date
-                break
-
-        # --- TOTAL extraction/normalization ---
-        total_amount = 0.0
-        # 1) prefer parsed total_amount if present
-        if parsed.get("total_amount") not in (None, "", []):
-            try:
-                total_amount = float(str(parsed.get("total_amount")).replace(",", "").strip())
-            except Exception:
-                total_amount = 0.0
-
-        # 2) fallback: regex search for total-like lines in the cleaned output
-        if not total_amount or total_amount == 0.0:
-            # look for lines containing total/grand total/amount payable, etc.
-            total_regexes = [
-                r"total(?:\s+amount)?[:\s]*₹?\s*([0-9]+(?:[.,][0-9]{1,2})?)",
-                r"grand total[:\s]*₹?\s*([0-9]+(?:[.,][0-9]{1,2})?)",
-                r"amount payable[:\s]*₹?\s*([0-9]+(?:[.,][0-9]{1,2})?)",
-                r"amount[:\s]*₹?\s*([0-9]+(?:[.,][0-9]{1,2})?)\s*$",
-                r"₹\s*([0-9]+(?:[.,][0-9]{1,2})?)",
-            ]
-            for rx in total_regexes:
-                m = re.search(rx, clean_output, flags=re.IGNORECASE | re.MULTILINE)
-                if m:
-                    try:
-                        total_amount = float(m.group(1).replace(",", "").strip())
-                        break
-                    except Exception:
-                        continue
-
-        # Final sanitize: ensure types
-        try:
-            total_amount = float(total_amount)
-        except Exception:
-            total_amount = 0.0
-
-        # Build result dict
-        result = {
-            "name": name,
-            "contact_number": contact_number,
-            "items_ordered": items_ordered,
-            "date": bill_date,
-            "total_amount": total_amount,
-        }
-
-        print("Extracted data:", result)
         return result
 
     except Exception as e:
         print("Error extracting text:", str(e))
-        raise HTTPException(status_code=500, detail=f"GPT-4 Vision error: {str(e)}")
-
-
-
-def extract_text_from_url(image_url: str) -> dict:
-    """
-    Extracts structured data from a remote image URL.
-    """
-    try:
-        print("Processing image URL with GPT-4 Vision...")
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are an expert data extractor for invoices and receipts.",
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": """Extract the following JSON:
-                        {
-                            "name": "<Customer Name>",
-                            "contact_number": "<Mobile Number>",
-                            "items_ordered": [
-                                {"item_name": "<Item>", "quantity": "<Qty>", "price": "<Price>"}
-                            ]
-                        }.
-                        Do not include explanations or text outside JSON."""},
-                        {"type": "image_url", "image_url": {"url": image_url}},
-                    ],
-                },
-            ],
-            temperature=0.1,
-        )
-
-        raw_output = response.choices[0].message.content
-        print("Raw GPT Output:", raw_output)
-        data = json.loads(raw_output)
-        return data
-
-    except Exception as e:
-        print("Error extracting text from URL:", str(e))
         raise HTTPException(status_code=500, detail=f"GPT-4 Vision error: {str(e)}")
 
 

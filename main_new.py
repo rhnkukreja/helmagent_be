@@ -59,17 +59,23 @@ def extract_text_from_image(image_bytes: bytes) -> dict:
                     "content": [
                         {
                             "type": "text",
-                            "text": """Extract the following information strictly in JSON:
-{
-  "name": "<Customer Name>",
-  "contact_number": "<Mobile Number>",
-  "items_ordered": [
-    {"item_name": "<Item>", "quantity": "<Qty>", "price": "<Price>"}
-  ],
-  "date": "<Bill date in ISO YYYY-MM-DD if possible>",
-  "total_amount": "<Total numeric amount, e.g., 123.45>"
-}
-If a field is missing, return an empty string or 0 for amounts. DO NOT add explanatory text — return only JSON or a code block containing JSON."""
+                            "text": """Extract the following fields from the bill image in strict JSON format:
+                            {
+                            "name": "<Customer Name>",
+                            "contact_number": "<Customer Mobile Number>",
+                            "items_ordered": [
+                                {"item_name": "<Item>", "quantity": "<Qty>", "price": "<Price>"}
+                            ],
+                            "date": "<Bill date in ISO YYYY-MM-DD>",
+                            "total_amount": "<Numeric Total>"
+                            }
+
+                            ⚠️ Important rules:
+                            - Ignore restaurant or merchant names, phone numbers, GST numbers, invoice numbers, and cashier names.
+                            - Only extract the *customer's* name and phone number if explicitly shown (like “Customer Name”, “Bill To”, or “Contact No”).
+                            - If no customer name or contact number is present, leave those fields empty.
+                            - Always include `items_ordered`, `date`, and `total_amount` if visible.
+                            - Return ONLY JSON — no extra text."""
                         },
                         {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + image_bytes.decode()}},
                     ],

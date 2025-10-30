@@ -7,13 +7,15 @@ import json
 import base64
 import zipfile
 import tempfile
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from supabase import create_client, Client
 from openai import OpenAI
 from dotenv import load_dotenv
 from datetime import datetime
+from datetime import timedelta
+import httpx
 from llm_responses import extract_text_from_image, extract_text_from_html
 from utils import store_in_supabase
 # -------------------- Configuration --------------------
@@ -22,7 +24,9 @@ load_dotenv()
 
 SUPABASE_KEY=os.getenv("SUPABASE_KEY")
 SUPABASE_URL=os.getenv("SUPABASE_URL")
-
+UNIPILE_API_KEY = os.getenv("UNIPILE_API_KEY")
+UNIPILE_BASE_URL = os.getenv("UNIPILE_BASE_URL")
+BACKEND_URL = os.getenv("BACKEND_URL")
 supabase: Client = create_client(SUPABASE_URL,SUPABASE_KEY)
 
 
@@ -164,12 +168,13 @@ async def process_bill(
 async def get_dashboard_data(org_id: str):
     try:
         print("Fetching organization for org_id:", org_id)
+        print("Supabase org_id type:", type(org_id), "value:", org_id)
 
         # --- fetch safely ---
         query = (
             supabase.table("organizations")
             .select("*")
-            .eq("org_id", org_id)  # Supabase client should handle UUID conversion
+            .eq("org_id", str(org_id))  # Supabase client should handle UUID conversion
         )
 
         # Use `.execute()` and check if data is empty
@@ -287,7 +292,97 @@ async def get_bills(org_id: str):
         print("Error fetching bills:", str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/generate-auth-link/")
+async def generate_auth_link(org_id: str = Form(...)):
+    """
+    Generates a Unipile WhatsApp authentication link for a specific org_id.
+    Requires org_id from frontend.
+    """
+    try: 
+        if not org_id:
+            raise HTTPException(status_code=400, detail="Missing org_id")
+        # Expiry time for the link
+        expires_on = (datetime.utcnow() + timedelta(minutes=10)).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+        headers = {"accept": "application/json", "content-type": "application/json", "X-API-KEY": UNIPILE_API_KEY}
 
+        payload = {
+            "type": "create",
+            "providers": ["WHATSAPP"],
+            "expiresOn": expires_on,
+            "api_url": UNIPILE_BASE_URL,
+            "bypass_success_screen": False,
+            "notify_url": f"{BACKEND_URL}/whatsapp/callback", 
+            "name": org_id,  # 👈 webhook target                                  # 👈 echo back your user
+        }
+        async with httpx.AsyncClient() as client:
+            response = await client.post(f"{UNIPILE_BASE_URL}/api/v1/hosted/accounts/link", json=payload, headers=headers)
+
+        if response.status_code // 100 != 2:
+            return JSONResponse(content={"error": response.text}, status_code=response.status_code)
+
+        result = response.json()
+        return JSONResponse(content={"url": result.get("url")}, status_code=200)
+    except HTTPException as he:
+        return JSONResponse(content={"error": he.detail}, status_code=he.status_code)
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+@app.post("/whatsapp/callback")
+async def whatsapp_callback(request: Request):
+    """
+    Webhook endpoint that receives notifications from Unipile 
+    when WhatsApp account status changes
+    """
+    try:
+        data = await request.json()
+        
+        # Extract key information from the webhook payload
+        account_id = data.get("account_id")
+        status = data.get("status")  # e.g., "connected", "disconnected", "error"
+        provider = data.get("provider")  # Should be "WHATSAPP"
+        org_id = data.get("name")  # The user_id you passed in the initial request
+        
+        print(f"Webhook received - Account: {account_id}, Status: {status}, org: {org_id}")
+        
+        # Handle different status scenarios
+        if status == "connected":
+            print(f"✅ WhatsApp connected successfully for org: {org_id}")
+            # await db.save_whatsapp_connection(org_id, account_id)
+
+        elif status == "disconnected":
+            print(f"⚠️ WhatsApp disconnected for org: {org_id}")
+            # await db.update_org_status(org_id, "disconnected")
+
+        elif status == "error":
+            error_message = data.get("error_message", "Unknown error")
+            print(f"❌ Error connecting WhatsApp for org {org_id}: {error_message}")
+            # await db.log_whatsapp_error(org_id, error_message)
+
+        # ✅ Acknowledge the webhook
+        return JSONResponse(
+            content={
+                "status": "received",
+                "account_id": account_id,
+                "org_id": org_id,
+                "processed": True
+            },
+            status_code=200
+        )
+
+    except Exception as e:
+        print(f"Error processing webhook: {str(e)}")
+        return JSONResponse(
+            content={"status": "error", "message": str(e)},
+            status_code=200
+        )
+        
+    except Exception as e:
+        print(f"Error processing webhook: {str(e)}")
+        # Still return 200 to prevent Unipile from retrying
+        return JSONResponse(
+            content={"status": "error", "message": str(e)},
+            status_code=200
+        )
 # --- ROOT ENDPOINT ---
 @app.get("/")
 async def root():

@@ -18,3 +18,4 @@ fuzzywuzzy==0.18.0
 python-levenshtein==0.21.1
 python-magic==0.4.27
 supabase
+openai

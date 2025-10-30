@@ -335,30 +335,41 @@ async def whatsapp_callback(request: Request):
     """
     try:
         data = await request.json()
-        
+
         # Extract key information from the webhook payload
         account_id = data.get("account_id")
-        status = data.get("status")  # e.g., "connected", "disconnected", "error"
-        provider = data.get("provider")  # Should be "WHATSAPP"
-        org_id = data.get("name")  # The user_id you passed in the initial request
-        
-        print(f"Webhook received - Account: {account_id}, Status: {status}, org: {org_id}")
-        
-        # Handle different status scenarios
+        status = data.get("status")        # e.g., "connected", "disconnected", "error"
+        provider = data.get("provider")    # Should be "WHATSAPP"
+        org_id = data.get("name")          # The org_id passed in your setup
+
+        print(f"📩 Webhook received - Account: {account_id}, Status: {status}, Org: {org_id}")
+
+        # ✅ Upsert WhatsApp connection info
+        res = supabase.table("whatsapp_connections").upsert(
+            {
+                "org_id": org_id,
+                "account_id": account_id,
+                "status": status,
+                "provider": provider,
+                "last_updated_at": datetime.utcnow().isoformat()
+            },
+            on_conflict="org_id"
+        ).execute()
+
+        print(f"🟢 Supabase upsert result: {res.data}")
+
+        # ✅ Handle status cases (optional — you can add DB actions here)
         if status == "connected":
             print(f"✅ WhatsApp connected successfully for org: {org_id}")
-            # await db.save_whatsapp_connection(org_id, account_id)
 
         elif status == "disconnected":
             print(f"⚠️ WhatsApp disconnected for org: {org_id}")
-            # await db.update_org_status(org_id, "disconnected")
 
         elif status == "error":
             error_message = data.get("error_message", "Unknown error")
-            print(f"❌ Error connecting WhatsApp for org {org_id}: {error_message}")
-            # await db.log_whatsapp_error(org_id, error_message)
+            print(f"❌ WhatsApp connection error for org {org_id}: {error_message}")
 
-        # ✅ Acknowledge the webhook
+        # ✅ Always return 200 to acknowledge webhook
         return JSONResponse(
             content={
                 "status": "received",
@@ -370,15 +381,8 @@ async def whatsapp_callback(request: Request):
         )
 
     except Exception as e:
-        print(f"Error processing webhook: {str(e)}")
-        return JSONResponse(
-            content={"status": "error", "message": str(e)},
-            status_code=200
-        )
-        
-    except Exception as e:
-        print(f"Error processing webhook: {str(e)}")
-        # Still return 200 to prevent Unipile from retrying
+        print(f"🚨 Error processing webhook: {str(e)}")
+        # Return 200 even on error so Unipile doesn’t retry
         return JSONResponse(
             content={"status": "error", "message": str(e)},
             status_code=200

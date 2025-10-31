@@ -27,6 +27,7 @@ SUPABASE_URL=os.getenv("SUPABASE_URL")
 UNIPILE_API_KEY = os.getenv("UNIPILE_API_KEY")
 UNIPILE_BASE_URL = os.getenv("UNIPILE_BASE_URL")
 BACKEND_URL = os.getenv("BACKEND_URL")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 supabase: Client = create_client(SUPABASE_URL,SUPABASE_KEY)
 
 
@@ -297,49 +298,28 @@ from fastapi import Request
 import traceback
 import json
 
-@app.post("/generate-auth-link")
-async def generate_auth_link(request: Request, org_id: str = Form(...)):
+@app.post("/generate-auth-link/")
+async def generate_auth_link(org_id: str = Form(...)):
     """
     Generates a Unipile WhatsApp authentication link for a specific org_id.
-    Requires org_id from frontend.
     """
-    print("\n" + "=" * 80)
-    print("🔥 GENERATE AUTH LINK ENDPOINT HIT")
-    print("=" * 80)
-    
     try:
-        # 1. Log request details
-        print("\n📨 REQUEST DETAILS:")
-        print(f"Method: {request.method}")
-        print(f"URL: {request.url}")
-        print(f"Client: {request.client}")
-        
-        # 2. Log headers
-        print("\n📋 HEADERS:")
-        for key, value in request.headers.items():
-            print(f"  {key}: {value}")
-        
-        # 3. Log received org_id
-        print(f"\n🆔 ORG_ID RECEIVED: '{org_id}'")
-        print(f"   Type: {type(org_id)}")
-        print(f"   Length: {len(org_id) if org_id else 0}")
-        
-        # 4. Validate org_id
         if not org_id:
-            print("❌ ERROR: org_id is empty or None")
             raise HTTPException(status_code=400, detail="Missing org_id")
-        
-        # 5. Log Unipile configuration
-        print("\n🔧 UNIPILE CONFIG:")
-        print(f"  Base URL: {UNIPILE_BASE_URL}")
-        print(f"  API Key: {UNIPILE_API_KEY[:10]}..." if UNIPILE_API_KEY else "  API Key: NOT SET")
-        print(f"  Backend URL: {BACKEND_URL}")
-        
-        # 6. Generate expiry
-        expires_on = (datetime.utcnow() + timedelta(minutes=10)).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
-        print(f"\n⏰ EXPIRES ON: {expires_on}")
-        
-        # 7. Build payload
+
+        # 🔹 Expiration timestamp for the auth link
+        expires_on = (
+            datetime.utcnow() + timedelta(minutes=10)
+        ).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+        # 🔹 Headers for Unipile API
+        headers = {
+            "accept": "application/json",
+            "content-type": "application/json",
+            "X-API-KEY": UNIPILE_API_KEY,
+        }
+
+        # 🔹 Payload for Unipile
         payload = {
             "type": "create",
             "providers": ["WHATSAPP"],
@@ -347,137 +327,61 @@ async def generate_auth_link(request: Request, org_id: str = Form(...)):
             "api_url": UNIPILE_BASE_URL,
             "bypass_success_screen": False,
             "notify_url": f"{BACKEND_URL}/whatsapp/callback",
-            "name": org_id,
+            "name": org_id,  # echo back org_id to identify webhook
         }
-        
-        print("\n📦 PAYLOAD TO UNIPILE:")
-        print(json.dumps(payload, indent=2))
-        
-        # 8. Build headers for Unipile
-        unipile_headers = {
-            "accept": "application/json",
-            "content-type": "application/json",
-            "X-API-KEY": UNIPILE_API_KEY
-        }
-        
-        print("\n📋 UNIPILE REQUEST HEADERS:")
-        for key, value in unipile_headers.items():
-            if key == "X-API-KEY":
-                print(f"  {key}: {value[:10]}...")
-            else:
-                print(f"  {key}: {value}")
-        
-        # 9. Make request to Unipile
-        unipile_url = f"{UNIPILE_BASE_URL}/api/v1/hosted/accounts/link"
-        print(f"\n🌐 CALLING UNIPILE: {unipile_url}")
-        
+
+        # 🔹 Make API call to Unipile
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
-                unipile_url,
+                f"{UNIPILE_BASE_URL}/api/v1/hosted/accounts/link",
                 json=payload,
-                headers=unipile_headers
+                headers=headers,
             )
-        
-        # 10. Log Unipile response
-        print(f"\n📬 UNIPILE RESPONSE:")
-        print(f"  Status Code: {response.status_code}")
-        print(f"  Headers: {dict(response.headers)}")
-        
-        try:
-            response_json = response.json()
-            print(f"  Body (JSON):")
-            print(json.dumps(response_json, indent=2))
-        except:
-            print(f"  Body (Text): {response.text[:500]}")
-        
-        # 11. Check response status
+
+        # 🔹 Handle API errors
         if response.status_code // 100 != 2:
-            print(f"\n❌ UNIPILE ERROR: Status {response.status_code}")
-            error_detail = {
-                "error": response.text,
-                "status_code": response.status_code
-            }
-            print(f"  Returning error: {error_detail}")
             return JSONResponse(
-                content=error_detail,
-                status_code=response.status_code
+                content={"error": response.text},
+                status_code=response.status_code,
             )
-        
-        # 12. Extract URL from response
+
+        # 🔹 Extract URL
         result = response.json()
         auth_url = result.get("url")
-        
-        print(f"\n✅ SUCCESS!")
-        print(f"  Auth URL: {auth_url}")
-        
-        print("\n" + "=" * 80)
-        print("🎉 ENDPOINT COMPLETED SUCCESSFULLY")
-        print("=" * 80 + "\n")
-        
+
         return JSONResponse(content={"url": auth_url}, status_code=200)
-        
+
     except HTTPException as he:
-        print(f"\n❌ HTTP EXCEPTION:")
-        print(f"  Status: {he.status_code}")
-        print(f"  Detail: {he.detail}")
-        print("=" * 80 + "\n")
-        return JSONResponse(
-            content={"error": he.detail},
-            status_code=he.status_code
-        )
-        
-    except httpx.TimeoutException as te:
-        print(f"\n❌ TIMEOUT EXCEPTION:")
-        print(f"  Error: {str(te)}")
-        print(f"  Traceback:\n{traceback.format_exc()}")
-        print("=" * 80 + "\n")
-        return JSONResponse(
-            content={"error": "Request to Unipile timed out"},
-            status_code=504
-        )
-        
-    except httpx.RequestError as re:
-        print(f"\n❌ REQUEST ERROR:")
-        print(f"  Error: {str(re)}")
-        print(f"  Traceback:\n{traceback.format_exc()}")
-        print("=" * 80 + "\n")
-        return JSONResponse(
-            content={"error": f"Network error: {str(re)}"},
-            status_code=502
-        )
-        
+        return JSONResponse(content={"error": he.detail}, status_code=he.status_code)
     except Exception as e:
-        print(f"\n❌ UNEXPECTED EXCEPTION:")
-        print(f"  Type: {type(e).__name__}")
-        print(f"  Message: {str(e)}")
-        print(f"  Traceback:\n{traceback.format_exc()}")
-        print("=" * 80 + "\n")
-        return JSONResponse(
-            content={"error": f"Internal server error: {str(e)}"},
-            status_code=500
-        )
-
-
+        return JSONResponse(content={"error": str(e)}, status_code=500)
 
 @app.post("/whatsapp/callback")
 async def whatsapp_callback(request: Request):
     """
     Webhook endpoint that receives notifications from Unipile 
-    when WhatsApp account status changes
+    when WhatsApp account status changes and updates Supabase.
     """
     try:
         data = await request.json()
 
-
-        # Extract key information from the webhook payload
+        # 🔹 Extract key fields
         account_id = data.get("account_id")
-        status = data.get("status")        # e.g., "connected", "disconnected", "error"
+        status = data.get("status")        # e.g. "connected", "disconnected", "error"
         provider = data.get("provider")    # Should be "WHATSAPP"
-        org_id = data.get("name")          # The org_id passed in your setup
+        org_id = data.get("name")          # org_id passed during auth link generation
 
         print(f"📩 Webhook received - Account: {account_id}, Status: {status}, Org: {org_id}")
 
-        # ✅ Upsert WhatsApp connection info
+        # 🔹 Validate required fields
+        if not org_id or not status:
+            print("❌ Missing required fields in webhook data.")
+            return JSONResponse(
+                content={"status": "error", "message": "Missing org_id or status"},
+                status_code=200  # Always return 200 to avoid Unipile retries
+            )
+
+        # 🔹 Upsert WhatsApp connection info into Supabase
         res = supabase.table("whatsapp_connections").upsert(
             {
                 "org_id": org_id,
@@ -491,28 +395,7 @@ async def whatsapp_callback(request: Request):
 
         print(f"🟢 Supabase upsert result: {res.data}")
 
-        # ✅ Handle status cases (optional — you can add DB actions here)
-        status = data.get("status")        # e.g., "connected", "disconnected", "error"
-        provider = data.get("provider")    # Should be "WHATSAPP"
-        org_id = data.get("name")          # The org_id passed in your setup
-
-        print(f"📩 Webhook received - Account: {account_id}, Status: {status}, Org: {org_id}")
-
-        # ✅ Upsert WhatsApp connection info
-        res = supabase.table("whatsapp_connections").upsert(
-            {
-                "org_id": org_id,
-                "account_id": account_id,
-                "status": status,
-                "provider": provider,
-                "last_updated_at": datetime.utcnow().isoformat()
-            },
-            on_conflict="org_id"
-        ).execute()
-
-        print(f"🟢 Supabase upsert result: {res.data}")
-
-        # ✅ Handle status cases (optional — you can add DB actions here)
+        # 🔹 Handle specific statuses
         if status == "connected":
             print(f"✅ WhatsApp connected successfully for org: {org_id}")
 
@@ -522,10 +405,8 @@ async def whatsapp_callback(request: Request):
         elif status == "error":
             error_message = data.get("error_message", "Unknown error")
             print(f"❌ WhatsApp connection error for org {org_id}: {error_message}")
-            print(f"❌ WhatsApp connection error for org {org_id}: {error_message}")
 
-        # ✅ Always return 200 to acknowledge webhook
-        # ✅ Always return 200 to acknowledge webhook
+        # 🔹 Always acknowledge webhook
         return JSONResponse(
             content={
                 "status": "received",
@@ -538,11 +419,19 @@ async def whatsapp_callback(request: Request):
 
     except Exception as e:
         print(f"🚨 Error processing webhook: {str(e)}")
-        # Return 200 even on error so Unipile doesn’t retry
+        # Return 200 to stop Unipile from retrying
         return JSONResponse(
             content={"status": "error", "message": str(e)},
             status_code=200
         )
+
+@app.get("/whatsapp/status/{org_id}")
+async def get_whatsapp_status(org_id: str):
+    res = supabase.table("whatsapp_connections").select("*").eq("org_id", org_id).execute()
+    print(res)
+    if not res.data:
+        return {"status": "not_connected"}
+    return res.data[0]
 
 
 from openai import OpenAI

@@ -292,40 +292,172 @@ async def get_bills(org_id: str):
         print("Error fetching bills:", str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/generate-auth-link/")
-async def generate_auth_link(org_id: str = Form(...)):
+
+from fastapi import Request
+import traceback
+import json
+
+@app.post("/generate-auth-link")
+async def generate_auth_link(request: Request, org_id: str = Form(...)):
     """
     Generates a Unipile WhatsApp authentication link for a specific org_id.
     Requires org_id from frontend.
     """
-    try: 
+    print("\n" + "=" * 80)
+    print("🔥 GENERATE AUTH LINK ENDPOINT HIT")
+    print("=" * 80)
+    
+    try:
+        # 1. Log request details
+        print("\n📨 REQUEST DETAILS:")
+        print(f"Method: {request.method}")
+        print(f"URL: {request.url}")
+        print(f"Client: {request.client}")
+        
+        # 2. Log headers
+        print("\n📋 HEADERS:")
+        for key, value in request.headers.items():
+            print(f"  {key}: {value}")
+        
+        # 3. Log received org_id
+        print(f"\n🆔 ORG_ID RECEIVED: '{org_id}'")
+        print(f"   Type: {type(org_id)}")
+        print(f"   Length: {len(org_id) if org_id else 0}")
+        
+        # 4. Validate org_id
         if not org_id:
+            print("❌ ERROR: org_id is empty or None")
             raise HTTPException(status_code=400, detail="Missing org_id")
-        # Expiry time for the link
+        
+        # 5. Log Unipile configuration
+        print("\n🔧 UNIPILE CONFIG:")
+        print(f"  Base URL: {UNIPILE_BASE_URL}")
+        print(f"  API Key: {UNIPILE_API_KEY[:10]}..." if UNIPILE_API_KEY else "  API Key: NOT SET")
+        print(f"  Backend URL: {BACKEND_URL}")
+        
+        # 6. Generate expiry
         expires_on = (datetime.utcnow() + timedelta(minutes=10)).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
-        headers = {"accept": "application/json", "content-type": "application/json", "X-API-KEY": UNIPILE_API_KEY}
-
+        print(f"\n⏰ EXPIRES ON: {expires_on}")
+        
+        # 7. Build payload
         payload = {
             "type": "create",
             "providers": ["WHATSAPP"],
             "expiresOn": expires_on,
             "api_url": UNIPILE_BASE_URL,
             "bypass_success_screen": False,
-            "notify_url": f"{BACKEND_URL}/whatsapp/callback", 
-            "name": org_id,  # 👈 webhook target                                  # 👈 echo back your user
+            "notify_url": f"{BACKEND_URL}/whatsapp/callback",
+            "name": org_id,
         }
-        async with httpx.AsyncClient() as client:
-            response = await client.post(f"{UNIPILE_BASE_URL}/api/v1/hosted/accounts/link", json=payload, headers=headers)
-
+        
+        print("\n📦 PAYLOAD TO UNIPILE:")
+        print(json.dumps(payload, indent=2))
+        
+        # 8. Build headers for Unipile
+        unipile_headers = {
+            "accept": "application/json",
+            "content-type": "application/json",
+            "X-API-KEY": UNIPILE_API_KEY
+        }
+        
+        print("\n📋 UNIPILE REQUEST HEADERS:")
+        for key, value in unipile_headers.items():
+            if key == "X-API-KEY":
+                print(f"  {key}: {value[:10]}...")
+            else:
+                print(f"  {key}: {value}")
+        
+        # 9. Make request to Unipile
+        unipile_url = f"{UNIPILE_BASE_URL}/api/v1/hosted/accounts/link"
+        print(f"\n🌐 CALLING UNIPILE: {unipile_url}")
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                unipile_url,
+                json=payload,
+                headers=unipile_headers
+            )
+        
+        # 10. Log Unipile response
+        print(f"\n📬 UNIPILE RESPONSE:")
+        print(f"  Status Code: {response.status_code}")
+        print(f"  Headers: {dict(response.headers)}")
+        
+        try:
+            response_json = response.json()
+            print(f"  Body (JSON):")
+            print(json.dumps(response_json, indent=2))
+        except:
+            print(f"  Body (Text): {response.text[:500]}")
+        
+        # 11. Check response status
         if response.status_code // 100 != 2:
-            return JSONResponse(content={"error": response.text}, status_code=response.status_code)
-
+            print(f"\n❌ UNIPILE ERROR: Status {response.status_code}")
+            error_detail = {
+                "error": response.text,
+                "status_code": response.status_code
+            }
+            print(f"  Returning error: {error_detail}")
+            return JSONResponse(
+                content=error_detail,
+                status_code=response.status_code
+            )
+        
+        # 12. Extract URL from response
         result = response.json()
-        return JSONResponse(content={"url": result.get("url")}, status_code=200)
+        auth_url = result.get("url")
+        
+        print(f"\n✅ SUCCESS!")
+        print(f"  Auth URL: {auth_url}")
+        
+        print("\n" + "=" * 80)
+        print("🎉 ENDPOINT COMPLETED SUCCESSFULLY")
+        print("=" * 80 + "\n")
+        
+        return JSONResponse(content={"url": auth_url}, status_code=200)
+        
     except HTTPException as he:
-        return JSONResponse(content={"error": he.detail}, status_code=he.status_code)
+        print(f"\n❌ HTTP EXCEPTION:")
+        print(f"  Status: {he.status_code}")
+        print(f"  Detail: {he.detail}")
+        print("=" * 80 + "\n")
+        return JSONResponse(
+            content={"error": he.detail},
+            status_code=he.status_code
+        )
+        
+    except httpx.TimeoutException as te:
+        print(f"\n❌ TIMEOUT EXCEPTION:")
+        print(f"  Error: {str(te)}")
+        print(f"  Traceback:\n{traceback.format_exc()}")
+        print("=" * 80 + "\n")
+        return JSONResponse(
+            content={"error": "Request to Unipile timed out"},
+            status_code=504
+        )
+        
+    except httpx.RequestError as re:
+        print(f"\n❌ REQUEST ERROR:")
+        print(f"  Error: {str(re)}")
+        print(f"  Traceback:\n{traceback.format_exc()}")
+        print("=" * 80 + "\n")
+        return JSONResponse(
+            content={"error": f"Network error: {str(re)}"},
+            status_code=502
+        )
+        
     except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        print(f"\n❌ UNEXPECTED EXCEPTION:")
+        print(f"  Type: {type(e).__name__}")
+        print(f"  Message: {str(e)}")
+        print(f"  Traceback:\n{traceback.format_exc()}")
+        print("=" * 80 + "\n")
+        return JSONResponse(
+            content={"error": f"Internal server error: {str(e)}"},
+            status_code=500
+        )
+
+
 
 @app.post("/whatsapp/callback")
 async def whatsapp_callback(request: Request):
@@ -383,6 +515,185 @@ async def whatsapp_callback(request: Request):
             content={"status": "error", "message": str(e)},
             status_code=200
         )
+
+
+from openai import OpenAI
+from pydantic import BaseModel
+from datetime import datetime
+
+# Initialize OpenAI client
+client = OpenAI(api_key="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")
+
+class GenerateMessageRequest(BaseModel):
+    name: str
+    phone: str
+    items_ordered: str
+    order_date: str
+    total_amount: float
+
+
+@app.post("/generate-message")
+async def generate_message(request: GenerateMessageRequest):
+    """
+    Generate personalized WhatsApp message using AI based on customer order data
+    """
+    try:
+        print("\n" + "="*60)
+        print("🤖 GENERATING AI MESSAGE")
+        print("="*60)
+        print(f"Customer: {request.name}")
+        print(f"Phone: {request.phone}")
+        print(f"Items: {request.items_ordered}")
+        print(f"Date: {request.order_date}")
+        print(f"Amount: ₹{request.total_amount}")
+        
+        # Create AI prompt
+        prompt = f"""Generate a friendly, personalized WhatsApp message for a restaurant customer asking for feedback.
+
+Customer Details:
+- Name: {request.name}
+- Order Date: {request.order_date}
+- Items Ordered: {request.items_ordered}
+- Total Amount: ₹{request.total_amount}
+
+Requirements:
+1. Use casual, friendly tone with emojis
+2. Thank them for visiting
+3. Mention 1-2 specific items they ordered and tell them facts about it , like chef's special, specially sourced ingredient etc
+4. Ask how their experience was
+5. Encourage them to share feedback
+6. Keep it under 150 words
+7. End with a call-to-action
+
+Restaurant Name: The Corner Cafe
+
+Generate the message now and just return the message:"""
+
+        # Call OpenAI API
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",  # or gpt-4o for better quality
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a friendly restaurant manager writing personalized WhatsApp messages to customers. Be warm, genuine, and encourage honest feedback."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            temperature=0.7,
+            max_tokens=300
+        )
+        
+        ai_message = response.choices[0].message.content.strip()
+        
+        print(f"\n✅ AI Message Generated:")
+        print(ai_message)
+        print("="*60 + "\n")
+        
+        return {
+            "success": True,
+            "message": ai_message,
+            "customer": {
+                "name": request.name,
+                "phone": request.phone
+            }
+        }
+        
+    except Exception as e:
+        print(f"\n❌ Error generating message: {str(e)}")
+        return JSONResponse(
+            content={
+                "success": False,
+                "error": f"Failed to generate message: {str(e)}"
+            },
+            status_code=500
+        )
+
+
+@app.post("/send-whatsapp")
+async def send_whatsapp(request: Request):
+    """
+    Send WhatsApp message to a single customer using Unipile
+    """
+    try:
+        print("\n" + "="*60)
+        print("📤 SENDING WHATSAPP MESSAGE")
+        print("="*60)
+        
+        # Parse request body
+        body = await request.json()
+        phone = body.get("phone")
+        message = body.get("message")
+        
+        if not phone or not message:
+            raise HTTPException(status_code=400, detail="Phone and message are required")
+        
+        print(f"To: {phone}")
+        print(f"Message: {message[:100]}...")
+
+        phone='+918219467323'
+        account_id = "HL9SULzcQ_qhWXOKWdnryQ"
+
+        # Headers for Unipile
+        headers = {
+            "accept": "application/json",
+            "X-API-KEY": UNIPILE_API_KEY
+        }
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            
+            # Send message via Unipile
+            form_data = {
+                "account_id": account_id,
+                "attendees_ids": phone,
+                "text": message
+            }
+            
+            # ✅ FIXED: Use 'data' without 'headers' parameter, or create new client with headers
+            send_response = await client.post(
+                f"{UNIPILE_BASE_URL}/api/v1/chats",
+                data=form_data,
+                headers={"X-API-KEY": UNIPILE_API_KEY}  # ✅ Pass headers inline
+            )
+            
+            print(f"Unipile Response: {send_response.status_code}")
+            
+            if send_response.status_code not in [200, 201]:
+                error_detail = send_response.text
+                print(f"❌ Failed: {error_detail}")
+                raise HTTPException(
+                    status_code=send_response.status_code,
+                    detail=f"Failed to send WhatsApp message: {error_detail}"
+                )
+            
+            result = send_response.json()
+            print(f"✅ Message sent successfully!")
+            print("="*60 + "\n")
+            
+            return {
+                "success": True,
+                "message": "WhatsApp message sent successfully",
+                "data": result
+            }
+            
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        print(f"\n❌ Error: {str(e)}")
+        return JSONResponse(
+            content={
+                "success": False,
+                "error": str(e)
+            },
+            status_code=500
+        )
+
+
+
+
+
 # --- ROOT ENDPOINT ---
 @app.get("/")
 async def root():

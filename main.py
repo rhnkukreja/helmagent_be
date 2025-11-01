@@ -36,7 +36,7 @@ import asyncio
 
 UNIPILE_API_KEY = "nnX2Om8V./30Vp9ruk3RXaLBxcydSAWXwJqantAMKf5goHMhLqUs="
 UNIPILE_BASE_URL = "https://api13.unipile.com:14315"
-BACKEND_URL = "https://add457c65882.ngrok-free.app"
+BACKEND_URL = "https://helmagent-be.fly.dev"
 
 
 app = FastAPI(title="Bill Processor API", version="1.0")
@@ -504,24 +504,23 @@ Restaurant Name: The Corner Cafe
 Generate the message now and just return the message:"""
 
         # Call OpenAI API
-        # response = client.chat.completions.create(
-        #     model="gpt-4o-mini",  # or gpt-4o for better quality
-        #     messages=[
-        #         {
-        #             "role": "system",
-        #             "content": "You are a friendly restaurant manager writing personalized WhatsApp messages to customers. Be warm, genuine, and encourage honest feedback."
-        #         },
-        #         {
-        #             "role": "user",
-        #             "content": prompt
-        #         }
-        #     ],
-        #     temperature=0.7,
-        #     max_tokens=300
-        # )
-        
-        # ai_message = response.choices[0].message.content.strip()
-        ai_message="jbkjbjb"
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",  # or gpt-4o for better quality
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a friendly restaurant manager writing personalized WhatsApp messages to customers. Be warm, genuine, and encourage honest feedback."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            temperature=0.7,
+            max_tokens=300
+        )
+
+        ai_message = response.choices[0].message.content.strip()
         
         print(f"\n✅ AI Message Generated:")
         print(ai_message)
@@ -559,8 +558,8 @@ Previous Messages:
 {message_list}
 
 Requirements:
-1. Start with a friendly greeting using the customer’s name (use emojis naturally)
-2. Refer to their previous visit casually (e.g., “Hope you enjoyed your Steam Rice last time!”)
+1. Start with a friendly greeting (use emojis naturally)
+2. Refer to their previous visit casually.
 3. Offer a light incentive, new dish recommendation, or invite them again (depending on tone)
 4. Keep tone warm, conversational, and under 120 words
 5. Include restaurant name: The Corner Cafe
@@ -726,8 +725,7 @@ async def send_whatsapp(request: Request):
         # Parse request body
         body = await request.json()
         org_id= body.get("org_id")
-        # phone = body.get("phone")
-        phone='9805345415'
+        phone = body.get("phone")
         message = body.get("message")
 
         
@@ -737,6 +735,7 @@ async def send_whatsapp(request: Request):
         print(f"To: {phone}")
         print(f"Message: {message[:100]}...")
         res = supabase.table("whatsapp_connections").select("account_id").eq("org_id", org_id).execute()
+        print(res)
 
         if not res.data or len(res.data) == 0 or not res.data[0].get("account_id"):
             raise HTTPException(status_code=404, detail="No WhatsApp account linked for this org_id")

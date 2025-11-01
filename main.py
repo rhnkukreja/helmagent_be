@@ -18,6 +18,7 @@ from datetime import timedelta
 import httpx
 from llm_responses import extract_text_from_image, extract_text_from_html
 from utils import store_in_supabase
+import requests
 
 # -------------------- Configuration --------------------
 # Load environment variables or hardcode for testing
@@ -664,7 +665,6 @@ def store_to_supabase(account_id, phone, message, sender, chat_id=None):
 
 
 
-import requests
 
 
 

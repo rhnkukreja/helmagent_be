@@ -311,7 +311,7 @@ import json
 
 
 
-@app.post("/generate-auth-link/")
+@app.post("/generate-auth-link")
 async def generate_auth_link(org_id: str = Form(...)):
     try:
         if not org_id:

@@ -25,11 +25,18 @@ load_dotenv()
 
 SUPABASE_KEY=os.getenv("SUPABASE_KEY")
 SUPABASE_URL=os.getenv("SUPABASE_URL")
-UNIPILE_API_KEY = os.getenv("UNIPILE_API_KEY")
-UNIPILE_BASE_URL = os.getenv("UNIPILE_BASE_URL")
-BACKEND_URL = os.getenv("BACKEND_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 supabase: Client = create_client(SUPABASE_URL,SUPABASE_KEY)
+
+
+import httpx
+import json
+from typing import List, Dict, Any
+import asyncio
+
+UNIPILE_API_KEY = "nnX2Om8V./30Vp9ruk3RXaLBxcydSAWXwJqantAMKf5goHMhLqUs="
+UNIPILE_BASE_URL = "https://api13.unipile.com:14315"
+BACKEND_URL = "https://add457c65882.ngrok-free.app"
 
 
 app = FastAPI(title="Bill Processor API", version="1.0")
@@ -299,39 +306,40 @@ from fastapi import Request
 import traceback
 import json
 
+
+
+
+
 @app.post("/generate-auth-link/")
 async def generate_auth_link(org_id: str = Form(...)):
-    """
-    Generates a Unipile WhatsApp authentication link for a specific org_id.
-    """
     try:
         if not org_id:
             raise HTTPException(status_code=400, detail="Missing org_id")
 
-        # 🔹 Expiration timestamp for the auth link
-        expires_on = (
-            datetime.utcnow() + timedelta(minutes=10)
-        ).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        dt = datetime.utcnow() + timedelta(minutes=10)
+        expires_on = dt.strftime("%Y-%m-%dT%H:%M:%S") + f".{dt.microsecond // 1000:03d}Z"
 
-        # 🔹 Headers for Unipile API
         headers = {
             "accept": "application/json",
             "content-type": "application/json",
             "X-API-KEY": UNIPILE_API_KEY,
         }
 
-        # 🔹 Payload for Unipile
         payload = {
             "type": "create",
             "providers": ["WHATSAPP"],
             "expiresOn": expires_on,
-            "api_url": UNIPILE_BASE_URL,
+            "api_url": UNIPILE_BASE_URL,  # ✅ THIS WAS MISSING
             "bypass_success_screen": False,
             "notify_url": f"{BACKEND_URL}/whatsapp/callback",
-            "name": org_id,  # echo back org_id to identify webhook
+            "name": org_id,
         }
 
-        # 🔹 Make API call to Unipile
+        print("=" * 50)
+        print("PAYLOAD BEING SENT:")
+        print(json.dumps(payload, indent=2))
+        print("=" * 50)
+
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 f"{UNIPILE_BASE_URL}/api/v1/hosted/accounts/link",
@@ -339,14 +347,15 @@ async def generate_auth_link(org_id: str = Form(...)):
                 headers=headers,
             )
 
-        # 🔹 Handle API errors
+        print("RESPONSE STATUS:", response.status_code)
+        print("RESPONSE BODY:", response.text)
+
         if response.status_code // 100 != 2:
             return JSONResponse(
                 content={"error": response.text},
                 status_code=response.status_code,
             )
 
-        # 🔹 Extract URL
         result = response.json()
         auth_url = result.get("url")
 
@@ -355,7 +364,14 @@ async def generate_auth_link(org_id: str = Form(...)):
     except HTTPException as he:
         return JSONResponse(content={"error": he.detail}, status_code=he.status_code)
     except Exception as e:
+        print("EXCEPTION:", str(e))
         return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
+
+
+
+
 
 @app.post("/whatsapp/callback")
 async def whatsapp_callback(request: Request):
@@ -537,23 +553,7 @@ async def generate_followup_message(message_list):
     Generate a contextual WhatsApp follow-up message based on previous AI messages and customer order data
     """
     try:
-        print("\n" + "="*60)
-        print("💬 GENERATING FOLLOW-UP AI MESSAGE")
-        print("="*60)
-        print(f"Customer: {request.name}")
-        print(f"Phone: {request.phone}")
-        print(f"Previous Messages: {getattr(request, 'previous_messages', 'N/A')}")
-        print(f"Last Order: {request.items_ordered} on {request.order_date}")
-        print(f"Total Amount: ₹{request.total_amount}")
-
-        # Create follow-up prompt
         prompt = f"""You are a restaurant manager sending a friendly WhatsApp follow-up message to a returning or past customer.
-
-Customer Details:
-- Name: {request.name}
-- Last Order Date: {request.order_date}
-- Items Ordered: {request.items_ordered}
-- Total Amount: ₹{request.total_amount}
 
 Previous Messages:
 {message_list}
@@ -592,14 +592,7 @@ Generate the follow-up WhatsApp message now and just return the message:"""
         print(ai_message)
         print("="*60 + "\n")
 
-        return {
-            "success": True,
-            "message": ai_message,
-            "customer": {
-                "name": request.name,
-                "phone": request.phone
-            }
-        }
+        return ai_message
 
     except Exception as e:
         print(f"\n❌ Error generating follow-up message: {str(e)}")
@@ -628,15 +621,13 @@ def store_to_supabase(account_id, phone, message, sender, chat_id=None):
 
         # Step 1: Check if chat already exists
         existing = supabase.table("conversations") \
-            .select("id, message_list") \
+            .select("*") \
             .eq("account_id", account_id) \
             .eq("phone", phone) \
             .execute()
 
 
         if existing.data and len(existing.data) > 0:
-            print(existing.data[0])
-            exit()
             # Chat exists — append to conversation list
             chat_id = existing.data[0]["chat_id"]
             conversation = existing.data[0].get("message_list", []) or []
@@ -645,7 +636,7 @@ def store_to_supabase(account_id, phone, message, sender, chat_id=None):
 
             res = supabase.table("conversations") \
                 .update({"message_list": conversation}) \
-                .eq("id", chat_id) \
+                .eq("chat_id", chat_id) \
                 .execute()
 
             print("🟢 Message appended to existing chat.")
@@ -676,8 +667,8 @@ def store_to_supabase(account_id, phone, message, sender, chat_id=None):
 
 import requests
 
-UNIPILE_API_KEY = "xfxDstf4.M2mcuZdRMOfR4gwBKRSJ6we2pszYQYLLUuHraHkBWXg="
-UNIPILE_BASE_URL = "https://api18.unipile.com:14803"
+
+
 
 def get_chat_id(account_id: str, phone: str):
     """
@@ -735,7 +726,8 @@ async def send_whatsapp(request: Request):
         # Parse request body
         body = await request.json()
         org_id= body.get("org_id")
-        phone = body.get("phone")
+        # phone = body.get("phone")
+        phone='9805345415'
         message = body.get("message")
 
         
@@ -748,6 +740,7 @@ async def send_whatsapp(request: Request):
 
         if not res.data or len(res.data) == 0 or not res.data[0].get("account_id"):
             raise HTTPException(status_code=404, detail="No WhatsApp account linked for this org_id")
+
 
         account_id = res.data[0]["account_id"]
         print(f"✅ Found account_id: {account_id}")
@@ -827,15 +820,6 @@ async def send_whatsapp(request: Request):
 
 
 
-import httpx
-import json
-from typing import List, Dict, Any
-import asyncio
-
-UNIPILE_BASE_URL = "https://api18.unipile.com:14803"
-UNIPILE_API_KEY = "xfxDstf4.M2mcuZdRMOfR4gwBKRSJ6we2pszYQYLLUuHraHkBWXg="
-BACKEND_URL = "https://7ffdfa80f9f4.ngrok-free.app"
-
 
 async def fetch_chat_messages(chat_id: str) -> List[Dict[str, Any]]:
     """
@@ -904,10 +888,7 @@ async def generate_response(chat_history: List[Dict[str, Any]]) -> str:
         return "Thanks for your message! How can I assist you today?"
 
 
-async def get_phone_from_chat_id(chat_id: str):
-    return phone
-
-async def send_message_to_chat(account_id, chat_id: str, message: str) -> Dict[str, Any]:
+async def send_message_to_chat(account_id, phone, chat_id: str, message: str) -> Dict[str, Any]:
     """
     Send a message to a specific chat using Unipile API.
     """
@@ -922,8 +903,7 @@ async def send_message_to_chat(account_id, chat_id: str, message: str) -> Dict[s
         "account_id":account_id
     }
 
-    phone=get_phone_from_chat_id(chat_id) # fetch phone from chat_id
-    store_to_supabase(account_id, chat_id, message, sender="res-owner")
+    store_to_supabase(account_id, phone, message, sender="res-owner", chat_id=chat_id)
 
     
     print(f"\n📤 Sending message to chat: {chat_id}")
@@ -956,7 +936,6 @@ async def send_message_to_chat(account_id, chat_id: str, message: str) -> Dict[s
 from fastapi import FastAPI, Request
 from typing import Any, Dict
 
-app = FastAPI()
 
 @app.post("/generate-send-followup")
 async def generate_and_send_response(request: Request) -> Dict[str, Any]:
@@ -980,6 +959,16 @@ async def generate_and_send_response(request: Request) -> Dict[str, Any]:
         attendee_provider_id= attendees_list[0]["attendee_provider_id"]
         phone = attendee_provider_id.replace("@s.whatsapp.net", "").replace("+", "").strip()
 
+        # ✅ Get sender info CORRECTLY
+        sender_info = data.get("sender", {})
+        sender_provider_id = sender_info.get("attendee_provider_id", "")
+        sender_phone = sender_provider_id.replace("@s.whatsapp.net", "").replace("+", "").strip()
+
+        # ✅ Check if bot sent this message
+        if sender_phone in ["919857240000", "9857240000"]:
+            print("🚫 Ignoring message from bot itself")
+            return {"success": True, "message": "Ignored bot message"}
+
         store_to_supabase(account_id, phone, message, sender="res_customer", chat_id=chat_id)
 
         # 1. Fetch chats (messages)
@@ -987,10 +976,10 @@ async def generate_and_send_response(request: Request) -> Dict[str, Any]:
         message_list= [msg.get("text", "") for msg in messages if msg.get("text")]
         
         # 2. Generate new message using LLM
-        new_message = generate_followup_message(message_list)
+        new_message = await generate_followup_message(message_list)
         
         # 3. Send the message to the chat
-        send_result = await send_message_to_chat(account_id, chat_id, new_message)
+        send_result = await send_message_to_chat(account_id, phone, chat_id, new_message)
         
         return {
             "success": True,

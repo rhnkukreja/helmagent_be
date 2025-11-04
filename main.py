@@ -416,22 +416,38 @@ async def whatsapp_callback(request: Request):
         print(f"🟢 Supabase upsert result: {res.data}")
 
         # 🔹 Handle specific statuses
-        if status == "connected":
-            print(f"✅ WhatsApp connected successfully for org: {org_id}")
+        if status == "OK":
+            print(f"✅ WhatsApp account running normally: {account_id}")
 
-        elif status == "disconnected":
-            print(f"⚠️ WhatsApp disconnected for org: {org_id}")
+        elif status == "CREDENTIALS":
+            print(f"🔴 CRITICAL: WhatsApp needs reconnection: {account_id}")
+            # TODO: Send email/notification to user to reconnect
+            # TODO: Generate reconnection link via Unipile API
+            
+        elif status == "ERROR" or status == "STOPPED":
+            print(f"❌ WhatsApp synchronization error: {account_id}")
+            
+        elif status == "CONNECTING":
+            print(f"🔄 WhatsApp attempting to connect: {account_id}")
+            
+        elif status == "DELETED":
+            print(f"🗑️ WhatsApp account deleted: {account_id}")
+            
+        elif status == "CREATION_SUCCESS":
+            print(f"🎉 WhatsApp account created successfully: {account_id}")
+            
+        elif status == "RECONNECTED":
+            print(f"✅ WhatsApp account reconnected: {account_id}")
+            
+        elif status == "SYNC_SUCCESS":
+            print(f"✅ WhatsApp synchronization completed: {account_id}")
 
-        elif status == "error":
-            error_message = data.get("error_message", "Unknown error")
-            print(f"❌ WhatsApp connection error for org {org_id}: {error_message}")
-
-        # 🔹 Always acknowledge webhook
+        # 🔹 Always acknowledge webhook within 30 seconds with 200 status
         return JSONResponse(
             content={
                 "status": "received",
                 "account_id": account_id,
-                "org_id": org_id,
+                "account_status": status,
                 "processed": True
             },
             status_code=200
@@ -439,7 +455,7 @@ async def whatsapp_callback(request: Request):
 
     except Exception as e:
         print(f"🚨 Error processing webhook: {str(e)}")
-        # Return 200 to stop Unipile from retrying
+        # Return 200 to stop Unipile from retrying (5 retries with delay)
         return JSONResponse(
             content={"status": "error", "message": str(e)},
             status_code=200
@@ -603,13 +619,22 @@ async def generate_followup_message(message_list):
             - Keep tone empathetic, sincere, and caring (1 emoji max).
             - End politely (e.g., “We truly hope to make your next visit delightful.”).
 
+            ⚙️ Additional Context-Aware Behavior:
+            - Read the conversation carefully before replying.
+            - If the customer has *already acknowledged or agreed to post a review* (e.g., messages like “surely will do that”, “already did”, “posted”, “done”, or similar),
+              then do NOT repeat the Google Review link or sample reviews.
+              Instead, simply thank them warmly for their support and express appreciation (1 emoji max).
+            - The reply should feel natural and context-aware — avoid repetition or robotic tone.
+
             Formatting:
             - Keep the entire message between 80–120 words.
             - Return only the WhatsApp message text.
             - Do not explain or label the mood.
             - The message should sound natural, like a real restaurant manager writing it personally.
+            3. Never return any refunds or compensation other than the 30% discount for BAD mood.
+
             """
-                    # Call OpenAI API
+                  # Call OpenAI API
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
@@ -1042,8 +1067,6 @@ async def generate_and_send_response(request: Request) -> Dict[str, Any]:
         #message_list= [msg.get("text", "") for msg in messages if msg.get("text")]
         # 1️⃣ Fetch stored conversation from Supabase instead of Unipile
         res = supabase.table("conversations").select("message_list").eq("chat_id", chat_id).execute()
-        print(res)
-        print("__________________")
         if not res.data or not res.data[0].get("message_list"):
             print("⚠️ No previous conversation found, starting fresh.")
             message_list = []
@@ -1082,7 +1105,72 @@ async def generate_and_send_response(request: Request) -> Dict[str, Any]:
 # chat_id = "upH0ipuLWw2EqU04JM2oUQ"  # Get from listing chats or webhook
 
 
+@app.get("/conversations/{org_id}")
+async def get_conversations(org_id: str):
+    """
+    Step 1: Fetch account_id from whatsapp_connections using org_id.
+    Step 2: Fetch conversations using account_id.
+    Step 3: Clean data and return JSON-stringified message_list.
+    """
+    try:
+        # Step 1 — get account_id
+        connection = (
+            supabase.table("whatsapp_connections")
+            .select("account_id")
+            .eq("org_id", org_id)
+            .single()
+            .execute()
+        )
 
+        if not connection.data or not connection.data.get("account_id"):
+            raise HTTPException(status_code=404, detail="No WhatsApp connection found for this organization")
+
+        account_id = connection.data["account_id"]
+        print("account_id:", account_id)
+
+        # Step 2 — fetch conversations
+        response = (
+            supabase.table("conversations")
+            .select("*")
+            .eq("account_id", account_id)
+            .order("created_at", desc=True)
+            .execute()
+        )
+
+        if not response.data:
+            return {"success": True, "data": []}
+
+        # Step 3 — clean data
+        conversations = []
+        for row in response.data:
+            # Ensure message_list is serialized properly
+            message_list = row.get("message_list", [])
+            if not isinstance(message_list, str):
+                try:
+                    message_list = json.dumps(message_list)
+                except Exception:
+                    message_list = "[]"
+
+            conversations.append({
+                "id": row.get("id"),
+                "name": row.get("name") or None,
+                "phone": row.get("phone"),
+                "chat_id": row.get("chat_id"),
+                "order_date": row.get("order_date"),
+                "message_list": message_list,
+                "created_at": row.get("created_at"),
+                "bill_price": row.get("bill_price"),
+                "account_id": row.get("account_id"),
+            })
+
+        print("✅ Conversations prepared:", len(conversations))
+        print(conversations)
+        return {"success": True, "data": conversations}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching conversations: {str(e)}")
 
 # --- ROOT ENDPOINT ---
 @app.get("/")

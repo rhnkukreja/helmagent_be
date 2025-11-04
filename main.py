@@ -384,14 +384,20 @@ async def whatsapp_callback(request: Request):
     """
     try:
         data = await request.json()
+        
+        # 🔹 LOG THE ENTIRE PAYLOAD TO SEE WHAT UNIPILE SENDS
+        print("=" * 50)
+        print("📩 RAW WEBHOOK DATA:")
+        print(json.dumps(data, indent=2))
+        print("=" * 50)
 
         # 🔹 Extract key fields
         account_id = data.get("account_id")
-        status = data.get("status")        # e.g. "connected", "disconnected", "error"
-        provider = data.get("provider")    # Should be "WHATSAPP"
-        org_id = data.get("name")          # org_id passed during auth link generation
+        status = data.get("status")
+        provider = data.get("provider")
+        org_id = data.get("name")
 
-        print(f"📩 Webhook received - Account: {account_id}, Status: {status}, Org: {org_id}")
+        print(f"📩 Parsed - Account: {account_id}, Status: {status}, Org: {org_id}")
 
         # 🔹 Validate required fields
         if not org_id or not status:
@@ -416,38 +422,22 @@ async def whatsapp_callback(request: Request):
         print(f"🟢 Supabase upsert result: {res.data}")
 
         # 🔹 Handle specific statuses
-        if status == "OK":
-            print(f"✅ WhatsApp account running normally: {account_id}")
+        if status == "connected":
+            print(f"✅ WhatsApp connected successfully for org: {org_id}")
 
-        elif status == "CREDENTIALS":
-            print(f"🔴 CRITICAL: WhatsApp needs reconnection: {account_id}")
-            # TODO: Send email/notification to user to reconnect
-            # TODO: Generate reconnection link via Unipile API
-            
-        elif status == "ERROR" or status == "STOPPED":
-            print(f"❌ WhatsApp synchronization error: {account_id}")
-            
-        elif status == "CONNECTING":
-            print(f"🔄 WhatsApp attempting to connect: {account_id}")
-            
-        elif status == "DELETED":
-            print(f"🗑️ WhatsApp account deleted: {account_id}")
-            
-        elif status == "CREATION_SUCCESS":
-            print(f"🎉 WhatsApp account created successfully: {account_id}")
-            
-        elif status == "RECONNECTED":
-            print(f"✅ WhatsApp account reconnected: {account_id}")
-            
-        elif status == "SYNC_SUCCESS":
-            print(f"✅ WhatsApp synchronization completed: {account_id}")
+        elif status == "disconnected":
+            print(f"⚠️ WhatsApp disconnected for org: {org_id}")
 
-        # 🔹 Always acknowledge webhook within 30 seconds with 200 status
+        elif status == "error":
+            error_message = data.get("error_message", "Unknown error")
+            print(f"❌ WhatsApp connection error for org {org_id}: {error_message}")
+
+        # 🔹 Always acknowledge webhook
         return JSONResponse(
             content={
                 "status": "received",
                 "account_id": account_id,
-                "account_status": status,
+                "org_id": org_id,
                 "processed": True
             },
             status_code=200
@@ -455,11 +445,12 @@ async def whatsapp_callback(request: Request):
 
     except Exception as e:
         print(f"🚨 Error processing webhook: {str(e)}")
-        # Return 200 to stop Unipile from retrying (5 retries with delay)
+        # Return 200 to stop Unipile from retrying
         return JSONResponse(
             content={"status": "error", "message": str(e)},
             status_code=200
         )
+
 
 @app.get("/whatsapp/status/{org_id}")
 async def get_whatsapp_status(org_id: str):
@@ -473,11 +464,42 @@ async def get_whatsapp_status(org_id: str):
 from openai import OpenAI
 from pydantic import BaseModel
 from datetime import datetime
-
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 # Initialize OpenAI client
 client = OpenAI(api_key=os.getenv(OPENAI_API_KEY))
+def get_restaurant_name(uuid: str) -> str:
+    """
+    Fetches the user's display name from Supabase Auth using UUID.
+    Reads from user_metadata['display_name'] (or falls back to full_name / restaurant_name / email).
+    """
+    try:
+        url = f"{SUPABASE_URL}/auth/v1/admin/users/{uuid}"
+        headers = {
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        }
+
+        res = requests.get(url, headers=headers)
+        res.raise_for_status()
+        user = res.json()
+
+        # Extract from nested user_metadata
+        metadata = user.get("user_metadata", {})
+        display_name = (
+            metadata.get("display_name")
+            or metadata.get("restaurant_name")
+            or metadata.get("full_name")
+            or user.get("email")
+        )
+
+        return display_name.strip() if display_name else "Unknown"
+    
+    except Exception as e:
+        print(f"❌ Error fetching display_name for {uuid}: {e}")
+        return "Unknown"
 
 class GenerateMessageRequest(BaseModel):
+    org_id: str  
     name: str
     phone: str
     items_ordered: str
@@ -494,15 +516,18 @@ async def generate_message(request: GenerateMessageRequest):
         print("\n" + "="*60)
         print("🤖 GENERATING AI MESSAGE")
         print("="*60)
+        print(f"Organization ID: {request.org_id}")
         print(f"Customer: {request.name}")
         print(f"Phone: {request.phone}")
         print(f"Items: {request.items_ordered}")
         print(f"Date: {request.order_date}")
         print(f"Amount: ₹{request.total_amount}")
-        
+        rest_name = get_restaurant_name(request.org_id)
+
         prompt = f"""
             You are a restaurant manager writing a personalized WhatsApp message to a customer after their visit.
-
+            Restaurant Details:
+            - Name: {rest_name}
             Customer Details:
             - Name: {request.name}
             - Order Date: {request.order_date}
@@ -532,7 +557,6 @@ async def generate_message(request: GenerateMessageRequest):
             8. Never mention ‘Beef’.
             9. Output only the WhatsApp message text — no explanations, no labels.
 
-            Restaurant Name: The Corner Cafe
             """
 
 
@@ -1171,6 +1195,159 @@ async def get_conversations(org_id: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching conversations: {str(e)}")
+
+@app.post("/disconnect")
+async def disconnect_whatsapp(request: Request):
+    """
+    Disconnect a WhatsApp account:
+    - Fetches the account_id from Supabase.
+    - Calls Unipile DELETE API to remove the connection.
+    - Clears account_id and status in Supabase.
+    """
+    try:
+        body = await request.json()
+        org_id = body.get("org_id")
+
+        if not org_id:
+            raise HTTPException(status_code=400, detail="Missing org_id")
+
+        print(f"🔹 Disconnecting WhatsApp for org_id: {org_id}")
+
+        # 1️⃣ Fetch the account_id from Supabase
+        res = supabase.table("whatsapp_connections").select("account_id").eq("org_id", org_id).execute()
+        if not res.data or not res.data[0].get("account_id"):
+            raise HTTPException(status_code=404, detail="No WhatsApp account linked for this organization")
+
+        account_id = res.data[0]["account_id"]
+        print(f"✅ Found account_id: {account_id}")
+
+        # 2️⃣ Call Unipile DELETE API
+        delete_url = f"{UNIPILE_BASE_URL}/api/v1/accounts/{account_id}"
+        headers = {
+            "accept": "application/json",
+            "X-API-KEY": UNIPILE_API_KEY,
+        }
+
+        print(f"🔸 Sending DELETE to {delete_url}")
+        response = requests.delete(delete_url, headers=headers)
+
+        if response.status_code not in [200, 204]:
+            print(f"❌ Failed to delete account from Unipile: {response.text}")
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=f"Unipile delete failed: {response.text}"
+            )
+
+        print(f"🗑️ Unipile account deleted successfully.")
+
+        # 3️⃣ Update Supabase — clear account_id & status
+        update_res = supabase.table("whatsapp_connections").upsert(
+            {
+                "org_id": org_id,
+                "account_id": "",
+                "status": "",
+                "last_updated_at": datetime.utcnow().isoformat()
+            },
+            on_conflict="org_id"
+        ).execute()
+
+        print(f"🧹 Supabase updated successfully: {update_res.data}")
+
+        return {
+            "success": True,
+            "message": "WhatsApp account disconnected successfully",
+            "org_id": org_id
+        }
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        print(f"❌ Error disconnecting WhatsApp: {e}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+class GoogleReviewLinkRequest(BaseModel):
+    org_id: str
+    link: str
+
+
+@app.post("/settings/save-google-review")
+async def save_google_review_link(request: GoogleReviewLinkRequest):
+    """
+    Save or update the Google Review link for the organization
+    """
+    try:
+        org_id = str(request.org_id).strip()
+        review_link = request.link.strip()
+        
+        if not org_id or not review_link:
+            raise HTTPException(status_code=400, detail="Missing org_id or link")
+        
+        # ✅ Check if organization exists
+        existing = supabase.table("organizations")\
+            .select("*")\
+            .eq("org_id", org_id)\
+            .execute()
+        
+        print(f"Query result: {existing.data}")
+        
+        if not existing.data or len(existing.data) == 0:
+            raise HTTPException(
+                status_code=404, 
+                detail=f"Organization not found with org_id: {org_id}"
+            )
+        
+        # ✅ Update the review link (NOT upsert, since org already exists)
+        response = supabase.table("organizations")\
+            .update({"google_review_link": review_link})\
+            .eq("org_id", org_id)\
+            .execute()
+        
+        if not response.data:
+            raise HTTPException(
+                status_code=500, 
+                detail="Failed to save Google Review link"
+            )
+        
+        return {
+            "message": "Google Review link saved successfully!", 
+            "data": response.data[0]
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error saving review link: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/settings/google-review/{org_id}")
+async def get_google_review_link(org_id: str):
+    """
+    Fetch the saved Google Review link for an organization.
+    Returns 404 if not found or link is empty.
+    """
+    try:
+        # ✅ Fetch google_review_link for this org_id
+        response = supabase.table("organizations") \
+            .select("google_review_link") \
+            .eq("org_id", org_id) \
+            .execute()
+
+        if not response.data:
+            raise HTTPException(status_code=404, detail="Organization not found")
+
+        review_link = response.data[0].get("google_review_link")
+
+        if not review_link:
+            raise HTTPException(status_code=404, detail="No review link found")
+
+        return {"link": review_link}
+
+    except Exception as e:
+        print("❌ Error fetching review link:", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 # --- ROOT ENDPOINT ---
 @app.get("/")

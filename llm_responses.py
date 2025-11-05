@@ -35,7 +35,7 @@ def extract_text_from_image(image_bytes: bytes) -> dict:
                             "text": """Extract the following fields from the bill image in strict JSON format:
                             {
                             "name": "<Customer Name>",
-                            "contact_number": "<Customer Mobile Number>",
+                            "contact_number": "<Customer Mobile Number>" for example +919857240000 or 9857240000,
                             "items_ordered": [
                                 {"item_name": "<Item>", "quantity": "<Qty>", "price": "<Price>"}
                             ],

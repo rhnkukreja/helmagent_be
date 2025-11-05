@@ -24,7 +24,7 @@ import requests
 # Load environment variables or hardcode for testing
 load_dotenv()
 
-SUPABASE_KEY=os.getenv("SUPABASE_KEY")
+SUPABASE_KEY=os.getenv("SUPABASE_SERVICE_KEY")
 SUPABASE_URL=os.getenv("SUPABASE_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 supabase: Client = create_client(SUPABASE_URL,SUPABASE_KEY)
@@ -630,7 +630,7 @@ async def generate_followup_message(message_list):
             - Address the person as "Sir" or "Ma'am" (never use their name).
             - Write a short, warm thank-you message for their kind words.
             - Politely ask them to share their experience on Google Reviews and include a link placeholder like:
-                👉 https://g.page/r/XXXXX/review
+                👉 https://maps.app.goo.gl/yPpFNAig6KkrN3YdA
             - Also generate 2–3 short sample reviews (each ≤ 30 words) that they can post directly.
             - Keep tone cheerful, appreciative, and authentic (use 1–2 emojis max).
             - End politely (e.g., “Looking forward to serving you again soon!”).

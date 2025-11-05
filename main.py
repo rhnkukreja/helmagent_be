@@ -35,11 +35,13 @@ import json
 from typing import List, Dict, Any
 import asyncio
 
-UNIPILE_API_KEY = "nnX2Om8V./30Vp9ruk3RXaLBxcydSAWXwJqantAMKf5goHMhLqUs="
-UNIPILE_BASE_URL = "https://api13.unipile.com:14315"
-BACKEND_URL = "https://helmagent-be.fly.dev"
+#UNIPILE_API_KEY = "nnX2Om8V./30Vp9ruk3RXaLBxcydSAWXwJqantAMKf5goHMhLqUs="
+#UNIPILE_BASE_URL = "https://api13.unipile.com:14315"
+#BACKEND_URL = "https://helmagent-be.fly.dev"
 
-
+UNIPILE_API_KEY = os.getenv("UNIPILE_API_KEY")
+UNIPILE_BASE_URL = os.getenv("UNIPILE_BASE_URL")
+BACKEND_URL = os.getenv("BACKEND_URL")
 app = FastAPI(title="Bill Processor API", version="1.0")
 
 app.add_middleware(
@@ -382,14 +384,20 @@ async def whatsapp_callback(request: Request):
     """
     try:
         data = await request.json()
+        
+        # 🔹 LOG THE ENTIRE PAYLOAD TO SEE WHAT UNIPILE SENDS
+        print("=" * 50)
+        print("📩 RAW WEBHOOK DATA:")
+        print(json.dumps(data, indent=2))
+        print("=" * 50)
 
         # 🔹 Extract key fields
         account_id = data.get("account_id")
-        status = data.get("status")        # e.g. "connected", "disconnected", "error"
-        provider = data.get("provider")    # Should be "WHATSAPP"
-        org_id = data.get("name")          # org_id passed during auth link generation
+        status = data.get("status")
+        provider = data.get("provider")
+        org_id = data.get("name")
 
-        print(f"📩 Webhook received - Account: {account_id}, Status: {status}, Org: {org_id}")
+        print(f"📩 Parsed - Account: {account_id}, Status: {status}, Org: {org_id}")
 
         # 🔹 Validate required fields
         if not org_id or not status:
@@ -443,6 +451,7 @@ async def whatsapp_callback(request: Request):
             status_code=200
         )
 
+
 @app.get("/whatsapp/status/{org_id}")
 async def get_whatsapp_status(org_id: str):
     res = supabase.table("whatsapp_connections").select("*").eq("org_id", org_id).execute()
@@ -455,11 +464,42 @@ async def get_whatsapp_status(org_id: str):
 from openai import OpenAI
 from pydantic import BaseModel
 from datetime import datetime
-
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 # Initialize OpenAI client
 client = OpenAI(api_key=os.getenv(OPENAI_API_KEY))
+def get_restaurant_name(uuid: str) -> str:
+    """
+    Fetches the user's display name from Supabase Auth using UUID.
+    Reads from user_metadata['display_name'] (or falls back to full_name / restaurant_name / email).
+    """
+    try:
+        url = f"{SUPABASE_URL}/auth/v1/admin/users/{uuid}"
+        headers = {
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        }
+
+        res = requests.get(url, headers=headers)
+        res.raise_for_status()
+        user = res.json()
+
+        # Extract from nested user_metadata
+        metadata = user.get("user_metadata", {})
+        display_name = (
+            metadata.get("display_name")
+            or metadata.get("restaurant_name")
+            or metadata.get("full_name")
+            or user.get("email")
+        )
+
+        return display_name.strip() if display_name else "Unknown"
+    
+    except Exception as e:
+        print(f"❌ Error fetching display_name for {uuid}: {e}")
+        return "Unknown"
 
 class GenerateMessageRequest(BaseModel):
+    org_id: str  
     name: str
     phone: str
     items_ordered: str
@@ -476,33 +516,49 @@ async def generate_message(request: GenerateMessageRequest):
         print("\n" + "="*60)
         print("🤖 GENERATING AI MESSAGE")
         print("="*60)
+        print(f"Organization ID: {request.org_id}")
         print(f"Customer: {request.name}")
         print(f"Phone: {request.phone}")
         print(f"Items: {request.items_ordered}")
         print(f"Date: {request.order_date}")
         print(f"Amount: ₹{request.total_amount}")
-        
-        # Create AI prompt
-        prompt = f"""Generate a friendly, personalized WhatsApp message for a restaurant customer asking for feedback.
+        rest_name = get_restaurant_name(request.org_id)
 
-Customer Details:
-- Name: {request.name}
-- Order Date: {request.order_date}
-- Items Ordered: {request.items_ordered}
-- Total Amount: ₹{request.total_amount}
+        prompt = f"""
+            You are a restaurant manager writing a personalized WhatsApp message to a customer after their visit.
+            Restaurant Details:
+            - Name: {rest_name}
+            Customer Details:
+            - Name: {request.name}
+            - Order Date: {request.order_date}
+            - Items Ordered: {request.items_ordered}
+            - Total Amount: ₹{request.total_amount}
 
-Requirements:
-1. Use casual, friendly tone with emojis
-2. Thank them for visiting
-3. Mention 1-2 specific items they ordered and tell them facts about it , like chef's special, specially sourced ingredient etc
-4. Ask how their experience was
-5. Encourage them to share feedback
-6. Keep it under 150 words
-7. End with a call-to-action
+            Goal:
+            Generate a warm, professional, and friendly WhatsApp message asking for customer feedback.
 
-Restaurant Name: The Corner Cafe
+            Guidelines:
+            1. Address the customer as:
+            - "{request.name} Sir" if the name sounds male
+            - "{request.name} Ma’am" if the name sounds female
+            - "Dear Guest" if gender is uncertain
+            (Always include greeting like “Hello” or “Dear”)
+            2. Use a conversational yet polished tone with 1–2 emojis — not overly casual, not overly formal.
+            3. Thank them sincerely for visiting and mention their order date naturally.
+            4. Highlight 1–2 dishes they ordered and include a short chef-inspired detail 
+            (e.g., “Our Butter Chicken is made with hand-ground spices for that authentic flavor.”)
+            5. Politely ask how their experience was and encourage them to share feedback.
+            6. Keep the message concise (under 150 words).
+            7. End with this exact closing format:
 
-Generate the message now and just return the message:"""
+            Warm regards,  
+            [Restaurant Name] Team ❤️
+
+            8. Never mention ‘Beef’.
+            9. Output only the WhatsApp message text — no explanations, no labels.
+
+            """
+
 
         # Call OpenAI API
         response = client.chat.completions.create(
@@ -553,23 +609,56 @@ async def generate_followup_message(message_list):
     Generate a contextual WhatsApp follow-up message based on previous AI messages and customer order data
     """
     try:
-        prompt = f"""You are a restaurant manager sending a friendly WhatsApp follow-up message to a returning or past customer.
+        print("\n" + "="*60)
+        print("🤖 GENERATING FOLLOW-UP MESSAGE")
+        
+        prompt = f"""
+            You are a restaurant manager at The Corner Cafe replying to a customer's recent WhatsApp message.
 
-Previous Messages:
-{message_list}
+            Conversation History:
+            {message_list}
 
-Requirements:
-1. Start with a friendly greeting (use emojis naturally)
-2. Refer to their previous visit casually.
-3. Offer a light incentive, new dish recommendation, or invite them again (depending on tone)
-4. Keep tone warm, conversational, and under 120 words
-5. Include restaurant name: The Corner Cafe
-6. End with a call to action (like “We’d love to host you again this weekend!”)
-7. Don’t repeat the same text as previous messages — make it feel like a real follow-up.
+            Your task:
+            1. Read the entire conversation and understand the tone, especially the latest customer message.
+            2. Analyze the tone to detect the customer's mood:
+            - If they sound happy, satisfied, thankful, or positive → mood = GOOD
+            - If they sound disappointed, mention poor service, bad food, delay, or complain → mood = BAD
 
-Generate the follow-up WhatsApp message now and just return the message:"""
+            Now follow these rules based on the detected mood:
 
-        # Call OpenAI API
+            🔹 If mood = GOOD:
+            - Address the person as "Sir" or "Ma'am" (never use their name).
+            - Write a short, warm thank-you message for their kind words.
+            - Politely ask them to share their experience on Google Reviews and include a link placeholder like:
+                👉 https://g.page/r/XXXXX/review
+            - Also generate 2–3 short sample reviews (each ≤ 30 words) that they can post directly.
+            - Keep tone cheerful, appreciative, and authentic (use 1–2 emojis max).
+            - End politely (e.g., “Looking forward to serving you again soon!”).
+
+            🔹 If mood = BAD:
+            - Address the person as "Sir" or "Ma'am" (never use their name).
+            - Gently apologize for their unpleasant experience.
+            - Acknowledge what went wrong (e.g., food quality, service delay, or general disappointment).
+            - Offer them a 30% discount on their next visit and encourage them to give you another chance.
+            - Keep tone empathetic, sincere, and caring (1 emoji max).
+            - End politely (e.g., “We truly hope to make your next visit delightful.”).
+
+            ⚙️ Additional Context-Aware Behavior:
+            - Read the conversation carefully before replying.
+            - If the customer has *already acknowledged or agreed to post a review* (e.g., messages like “surely will do that”, “already did”, “posted”, “done”, or similar),
+              then do NOT repeat the Google Review link or sample reviews.
+              Instead, simply thank them warmly for their support and express appreciation (1 emoji max).
+            - The reply should feel natural and context-aware — avoid repetition or robotic tone.
+
+            Formatting:
+            - Keep the entire message between 80–120 words.
+            - Return only the WhatsApp message text.
+            - Do not explain or label the mood.
+            - The message should sound natural, like a real restaurant manager writing it personally.
+            3. Never return any refunds or compensation other than the 30% discount for BAD mood.
+
+            """
+                  # Call OpenAI API
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
@@ -735,8 +824,7 @@ async def send_whatsapp(request: Request):
         print(f"To: {phone}")
         print(f"Message: {message[:100]}...")
         res = supabase.table("whatsapp_connections").select("account_id").eq("org_id", org_id).execute()
-        print(res)
-
+ 
         if not res.data or len(res.data) == 0 or not res.data[0].get("account_id"):
             raise HTTPException(status_code=404, detail="No WhatsApp account linked for this org_id")
 
@@ -747,7 +835,6 @@ async def send_whatsapp(request: Request):
         formatted_phone = f"91{phone}@s.whatsapp.net"
         print(f"📱 Sending to WhatsApp ID: {formatted_phone}")
         print(f"account_id: {account_id}")
-
 
         # phone='+918219467323'
         # account_id = "HL9SULzcQ_qhWXOKWdnryQ"
@@ -763,7 +850,7 @@ async def send_whatsapp(request: Request):
             "attendees_ids": formatted_phone,
             "text": message
         }
-        
+        print(f'Form Data: {form_data}')
         async with httpx.AsyncClient(timeout=30.0, headers=headers) as client:
             
             # Send message via Unipile
@@ -794,7 +881,7 @@ async def send_whatsapp(request: Request):
             chat_id=get_chat_id(account_id, phone)
 
             # Store message to Supabase
-            store_to_supabase(account_id, phone, message, sender="res-owner", chat_id=chat_id)
+            store_to_supabase(account_id, phone, message, sender="res_owner", chat_id=chat_id)
 
 
             return {
@@ -902,7 +989,7 @@ async def send_message_to_chat(account_id, phone, chat_id: str, message: str) ->
         "account_id":account_id
     }
 
-    store_to_supabase(account_id, phone, message, sender="res-owner", chat_id=chat_id)
+    store_to_supabase(account_id, phone, message, sender="res_owner", chat_id=chat_id)
 
     
     print(f"\n📤 Sending message to chat: {chat_id}")
@@ -950,6 +1037,13 @@ async def generate_and_send_response(request: Request) -> Dict[str, Any]:
         print("Incoming webhook data:", data)
 
         # Extract required fields safely
+        sender_id = (data.get("sender", {}).get("attendee_provider_id", "") or "").strip()
+        attendee_id = (data.get("attendees", [{}])[0].get("attendee_provider_id", "") or "").strip()
+
+        sender_phone = sender_id.replace("@s.whatsapp.net", "").replace("+", "")
+        attendee_phone = attendee_id.replace("@s.whatsapp.net", "").replace("+", "")
+
+        print(f"➡️ Sender: {sender_phone}, Attendee: {attendee_phone}")
         event_type = data.get("event")
         account_id = data.get("account_id")
         chat_id = data.get("chat_id")
@@ -957,23 +1051,56 @@ async def generate_and_send_response(request: Request) -> Dict[str, Any]:
         attendees_list = data.get("attendees")
         attendee_provider_id= attendees_list[0]["attendee_provider_id"]
         phone = attendee_provider_id.replace("@s.whatsapp.net", "").replace("+", "").strip()
+        if phone.startswith("91"):
+            phone = phone[2:]
 
         # ✅ Get sender info CORRECTLY
         sender_info = data.get("sender", {})
         sender_provider_id = sender_info.get("attendee_provider_id", "")
         sender_phone = sender_provider_id.replace("@s.whatsapp.net", "").replace("+", "").strip()
-
+        if sender_phone != attendee_phone:
+            print("🚫 Ignoring self-sent message (bot message)")
+            return {"success": True, "message": "Ignored self-sent message"}
         # ✅ Check if bot sent this message
         if sender_phone in ["919857240000", "9857240000"]:
             print("🚫 Ignoring message from bot itself")
             return {"success": True, "message": "Ignored bot message"}
+        # ✅ Step 1: Check if conversation exists before replying
+        check_chat = supabase.table("conversations") \
+            .select("chat_id") \
+            .eq("account_id", account_id) \
+            .eq("phone", phone) \
+            .execute()
 
+
+        if not check_chat.data or len(check_chat.data) == 0:
+            print(f"🚫 No conversation found for chat_id={chat_id}. Ignoring follow-up.")
+            return {
+                "success": True,
+                "message": "Ignored - conversation not initiated by system"
+            }
+
+        print(f"✅ Verified existing conversation for chat_id={chat_id}")
+
+        # ✅ Step 2: Store this new customer message in conversation
         store_to_supabase(account_id, phone, message, sender="res_customer", chat_id=chat_id)
 
-        # 1. Fetch chats (messages)
-        messages = await fetch_chat_messages(chat_id)
-        message_list= [msg.get("text", "") for msg in messages if msg.get("text")]
-        
+
+         # 1. Fetch chats (messages)
+        #messages = await fetch_chat_messages(chat_id)
+        #message_list= [msg.get("text", "") for msg in messages if msg.get("text")]
+        # 1️⃣ Fetch stored conversation from Supabase instead of Unipile
+        res = supabase.table("conversations").select("message_list").eq("chat_id", chat_id).execute()
+        if not res.data or not res.data[0].get("message_list"):
+            print("⚠️ No previous conversation found, starting fresh.")
+            message_list = []
+        else:
+            message_list = res.data[0]["message_list"]
+            print(f"💬 Loaded {len(message_list)} previous messages from Supabase.")
+
+        # 2️⃣ Append the newest customer message to context before generation
+        message_list.append({"res_customer": message})
+
         # 2. Generate new message using LLM
         new_message = await generate_followup_message(message_list)
         
@@ -1002,7 +1129,225 @@ async def generate_and_send_response(request: Request) -> Dict[str, Any]:
 # chat_id = "upH0ipuLWw2EqU04JM2oUQ"  # Get from listing chats or webhook
 
 
+@app.get("/conversations/{org_id}")
+async def get_conversations(org_id: str):
+    """
+    Step 1: Fetch account_id from whatsapp_connections using org_id.
+    Step 2: Fetch conversations using account_id.
+    Step 3: Clean data and return JSON-stringified message_list.
+    """
+    try:
+        # Step 1 — get account_id
+        connection = (
+            supabase.table("whatsapp_connections")
+            .select("account_id")
+            .eq("org_id", org_id)
+            .single()
+            .execute()
+        )
 
+        if not connection.data or not connection.data.get("account_id"):
+            raise HTTPException(status_code=404, detail="No WhatsApp connection found for this organization")
+
+        account_id = connection.data["account_id"]
+        print("account_id:", account_id)
+
+        # Step 2 — fetch conversations
+        response = (
+            supabase.table("conversations")
+            .select("*")
+            .eq("account_id", account_id)
+            .order("created_at", desc=True)
+            .execute()
+        )
+
+        if not response.data:
+            return {"success": True, "data": []}
+
+        # Step 3 — clean data
+        conversations = []
+        for row in response.data:
+            # Ensure message_list is serialized properly
+            message_list = row.get("message_list", [])
+            if not isinstance(message_list, str):
+                try:
+                    message_list = json.dumps(message_list)
+                except Exception:
+                    message_list = "[]"
+
+            conversations.append({
+                "id": row.get("id"),
+                "name": row.get("name") or None,
+                "phone": row.get("phone"),
+                "chat_id": row.get("chat_id"),
+                "order_date": row.get("order_date"),
+                "message_list": message_list,
+                "created_at": row.get("created_at"),
+                "bill_price": row.get("bill_price"),
+                "account_id": row.get("account_id"),
+            })
+
+        print("✅ Conversations prepared:", len(conversations))
+        print(conversations)
+        return {"success": True, "data": conversations}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching conversations: {str(e)}")
+
+@app.post("/disconnect")
+async def disconnect_whatsapp(request: Request):
+    """
+    Disconnect a WhatsApp account:
+    - Fetches the account_id from Supabase.
+    - Calls Unipile DELETE API to remove the connection.
+    - Clears account_id and status in Supabase.
+    """
+    try:
+        body = await request.json()
+        org_id = body.get("org_id")
+
+        if not org_id:
+            raise HTTPException(status_code=400, detail="Missing org_id")
+
+        print(f"🔹 Disconnecting WhatsApp for org_id: {org_id}")
+
+        # 1️⃣ Fetch the account_id from Supabase
+        res = supabase.table("whatsapp_connections").select("account_id").eq("org_id", org_id).execute()
+        if not res.data or not res.data[0].get("account_id"):
+            raise HTTPException(status_code=404, detail="No WhatsApp account linked for this organization")
+
+        account_id = res.data[0]["account_id"]
+        print(f"✅ Found account_id: {account_id}")
+
+        # 2️⃣ Call Unipile DELETE API
+        delete_url = f"{UNIPILE_BASE_URL}/api/v1/accounts/{account_id}"
+        headers = {
+            "accept": "application/json",
+            "X-API-KEY": UNIPILE_API_KEY,
+        }
+
+        print(f"🔸 Sending DELETE to {delete_url}")
+        response = requests.delete(delete_url, headers=headers)
+
+        if response.status_code not in [200, 204]:
+            print(f"❌ Failed to delete account from Unipile: {response.text}")
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=f"Unipile delete failed: {response.text}"
+            )
+
+        print(f"🗑️ Unipile account deleted successfully.")
+
+        # 3️⃣ Update Supabase — clear account_id & status
+        update_res = supabase.table("whatsapp_connections").upsert(
+            {
+                "org_id": org_id,
+                "account_id": "",
+                "status": "",
+                "last_updated_at": datetime.utcnow().isoformat()
+            },
+            on_conflict="org_id"
+        ).execute()
+
+        print(f"🧹 Supabase updated successfully: {update_res.data}")
+
+        return {
+            "success": True,
+            "message": "WhatsApp account disconnected successfully",
+            "org_id": org_id
+        }
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        print(f"❌ Error disconnecting WhatsApp: {e}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+class GoogleReviewLinkRequest(BaseModel):
+    org_id: str
+    link: str
+
+
+@app.post("/settings/save-google-review")
+async def save_google_review_link(request: GoogleReviewLinkRequest):
+    """
+    Save or update the Google Review link for the organization
+    """
+    try:
+        org_id = str(request.org_id).strip()
+        review_link = request.link.strip()
+        
+        if not org_id or not review_link:
+            raise HTTPException(status_code=400, detail="Missing org_id or link")
+        
+        # ✅ Check if organization exists
+        existing = supabase.table("organizations")\
+            .select("*")\
+            .eq("org_id", org_id)\
+            .execute()
+        
+        print(f"Query result: {existing.data}")
+        
+        if not existing.data or len(existing.data) == 0:
+            raise HTTPException(
+                status_code=404, 
+                detail=f"Organization not found with org_id: {org_id}"
+            )
+        
+        # ✅ Update the review link (NOT upsert, since org already exists)
+        response = supabase.table("organizations")\
+            .update({"google_review_link": review_link})\
+            .eq("org_id", org_id)\
+            .execute()
+        
+        if not response.data:
+            raise HTTPException(
+                status_code=500, 
+                detail="Failed to save Google Review link"
+            )
+        
+        return {
+            "message": "Google Review link saved successfully!", 
+            "data": response.data[0]
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error saving review link: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/settings/google-review/{org_id}")
+async def get_google_review_link(org_id: str):
+    """
+    Fetch the saved Google Review link for an organization.
+    Returns 404 if not found or link is empty.
+    """
+    try:
+        # ✅ Fetch google_review_link for this org_id
+        response = supabase.table("organizations") \
+            .select("google_review_link") \
+            .eq("org_id", org_id) \
+            .execute()
+
+        if not response.data:
+            raise HTTPException(status_code=404, detail="Organization not found")
+
+        review_link = response.data[0].get("google_review_link")
+
+        if not review_link:
+            raise HTTPException(status_code=404, detail="No review link found")
+
+        return {"link": review_link}
+
+    except Exception as e:
+        print("❌ Error fetching review link:", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 # --- ROOT ENDPOINT ---
 @app.get("/")

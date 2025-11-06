@@ -19,6 +19,7 @@ import httpx
 from llm_responses import extract_text_from_image, extract_text_from_html
 from utils import store_in_supabase
 import requests
+from routes_whatsapp import router as whatsapp_router
 
 # -------------------- Configuration --------------------
 # Load environment variables or hardcode for testing
@@ -53,6 +54,7 @@ app.add_middleware(
 )
 
 # -------------------- API Routes --------------------
+app.include_router(whatsapp_router)
 
 
 @app.post("/process-bill/")

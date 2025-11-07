@@ -16,15 +16,16 @@ from dotenv import load_dotenv
 from datetime import datetime
 from datetime import timedelta
 import httpx
-from llm_responses import extract_text_from_image, extract_text_from_html
+from llm_responses import extract_text_from_image, extract_text_from_html, generate_followup_message
 from utils import store_in_supabase
 import requests
+from routes_whatsapp import router as whatsapp_router
 
 # -------------------- Configuration --------------------
 # Load environment variables or hardcode for testing
 load_dotenv()
 
-SUPABASE_KEY=os.getenv("SUPABASE_KEY")
+SUPABASE_KEY=os.getenv("SUPABASE_SERVICE_KEY")
 SUPABASE_URL=os.getenv("SUPABASE_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 supabase: Client = create_client(SUPABASE_URL,SUPABASE_KEY)
@@ -53,6 +54,7 @@ app.add_middleware(
 )
 
 # -------------------- API Routes --------------------
+app.include_router(whatsapp_router)
 
 
 @app.post("/process-bill/")
@@ -604,96 +606,6 @@ async def generate_message(request: GenerateMessageRequest):
 
 
 
-async def generate_followup_message(message_list):
-    """
-    Generate a contextual WhatsApp follow-up message based on previous AI messages and customer order data
-    """
-    try:
-        print("\n" + "="*60)
-        print("🤖 GENERATING FOLLOW-UP MESSAGE")
-        
-        prompt = f"""
-            You are a restaurant manager at The Corner Cafe replying to a customer's recent WhatsApp message.
-
-            Conversation History:
-            {message_list}
-
-            Your task:
-            1. Read the entire conversation and understand the tone, especially the latest customer message.
-            2. Analyze the tone to detect the customer's mood:
-            - If they sound happy, satisfied, thankful, or positive → mood = GOOD
-            - If they sound disappointed, mention poor service, bad food, delay, or complain → mood = BAD
-
-            Now follow these rules based on the detected mood:
-
-            🔹 If mood = GOOD:
-            - Address the person as "Sir" or "Ma'am" (never use their name).
-            - Write a short, warm thank-you message for their kind words.
-            - Politely ask them to share their experience on Google Reviews and include a link placeholder like:
-                👉 https://g.page/r/XXXXX/review
-            - Also generate 2–3 short sample reviews (each ≤ 30 words) that they can post directly.
-            - Keep tone cheerful, appreciative, and authentic (use 1–2 emojis max).
-            - End politely (e.g., “Looking forward to serving you again soon!”).
-
-            🔹 If mood = BAD:
-            - Address the person as "Sir" or "Ma'am" (never use their name).
-            - Gently apologize for their unpleasant experience.
-            - Acknowledge what went wrong (e.g., food quality, service delay, or general disappointment).
-            - Offer them a 30% discount on their next visit and encourage them to give you another chance.
-            - Keep tone empathetic, sincere, and caring (1 emoji max).
-            - End politely (e.g., “We truly hope to make your next visit delightful.”).
-
-            ⚙️ Additional Context-Aware Behavior:
-            - Read the conversation carefully before replying.
-            - If the customer has *already acknowledged or agreed to post a review* (e.g., messages like “surely will do that”, “already did”, “posted”, “done”, or similar),
-              then do NOT repeat the Google Review link or sample reviews.
-              Instead, simply thank them warmly for their support and express appreciation (1 emoji max).
-            - The reply should feel natural and context-aware — avoid repetition or robotic tone.
-
-            Formatting:
-            - Keep the entire message between 80–120 words.
-            - Return only the WhatsApp message text.
-            - Do not explain or label the mood.
-            - The message should sound natural, like a real restaurant manager writing it personally.
-            3. Never return any refunds or compensation other than the 30% discount for BAD mood.
-
-            """
-                  # Call OpenAI API
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a friendly restaurant manager following up with customers on WhatsApp. Write human-like, engaging, and caring messages that sound personal."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            temperature=0.8,
-            max_tokens=300
-        )
-
-        ai_message = response.choices[0].message.content.strip()
-
-        print(f"\n✅ Follow-up AI Message Generated:")
-        print(ai_message)
-        print("="*60 + "\n")
-
-        return ai_message
-
-    except Exception as e:
-        print(f"\n❌ Error generating follow-up message: {str(e)}")
-        return JSONResponse(
-            content={
-                "success": False,
-                "error": f"Failed to generate follow-up message: {str(e)}"
-            },
-            status_code=500
-        )
-
-
 
 
 from datetime import datetime
@@ -799,12 +711,11 @@ def get_chat_id(account_id: str, phone: str):
 
 
 
-
+"""
 @app.post("/send-whatsapp")
 async def send_whatsapp(request: Request):
-    """
-    Send WhatsApp message to a single customer using Unipile
-    """
+    # Send WhatsApp message to a single customer using Unipile
+
     try:
         print("\n" + "="*60)
         print("📤 SENDING WHATSAPP MESSAGE")
@@ -902,7 +813,7 @@ async def send_whatsapp(request: Request):
             status_code=500
         )
 
-
+"""
 
 
 
@@ -1138,6 +1049,7 @@ async def get_conversations(org_id: str):
     """
     try:
         # Step 1 — get account_id
+        """ 
         connection = (
             supabase.table("whatsapp_connections")
             .select("account_id")
@@ -1151,12 +1063,13 @@ async def get_conversations(org_id: str):
 
         account_id = connection.data["account_id"]
         print("account_id:", account_id)
-
+        """
+        session_id = org_id
         # Step 2 — fetch conversations
         response = (
             supabase.table("conversations")
             .select("*")
-            .eq("account_id", account_id)
+            .eq("session_id", session_id)
             .order("created_at", desc=True)
             .execute()
         )
@@ -1179,12 +1092,11 @@ async def get_conversations(org_id: str):
                 "id": row.get("id"),
                 "name": row.get("name") or None,
                 "phone": row.get("phone"),
-                "chat_id": row.get("chat_id"),
                 "order_date": row.get("order_date"),
                 "message_list": message_list,
                 "created_at": row.get("created_at"),
                 "bill_price": row.get("bill_price"),
-                "account_id": row.get("account_id"),
+                "session_id": row.get("session_id"),
             })
 
         print("✅ Conversations prepared:", len(conversations))

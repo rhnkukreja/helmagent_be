@@ -1,0 +1,36 @@
+# =======================================
+# 🐋 Docker Ignore File
+# =======================================
+
+# Python cache and virtual environments
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+venv/
+.env
+
+# Node modules (they'll be installed fresh in Docker)
+node_modules/
+whatsapp_service/node_modules/
+
+# Build / temporary / local
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Repomix output and other large dev artifacts
+repomix-output.md
+
+# Git
+.git/
+.gitignore
+
+# IDE and editor folders
+.vscode/
+.idea/

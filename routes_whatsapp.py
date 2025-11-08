@@ -98,16 +98,21 @@ async def start_session(request: StartSessionRequest):
     session_id = request.org_id
 
     async with httpx.AsyncClient() as client:
+        print(f"Requesting Node.js service to start session {session_id} ...")
         try:
+            print("Sending request to Node.js service...")
+            print(f"URL: {WHATSAPP_SERVICE_URL}/session/start")
             response = await client.post(
                 f"{WHATSAPP_SERVICE_URL}/session/start",
                 json={"session_id": session_id},
                 timeout=10.0
             )
             response.raise_for_status()
+            print("Node.js service response:", response.status_code, await response.aread())
         except Exception as e:
+            print(f"Error starting WA session: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to start WA session: {str(e)}")
-
+    print("Node.js service started session successfully.")
     active_sessions[session_id] = {
         "user_id": request.org_id,
         "status": "initializing",
@@ -115,6 +120,7 @@ async def start_session(request: StartSessionRequest):
         "phone": None,
         "created_at": datetime.utcnow()
     }
+    print("Active sessions:", active_sessions.keys())
     save_session_to_db(session_id, request.org_id, "initializing")
 
     return {
@@ -126,10 +132,16 @@ async def start_session(request: StartSessionRequest):
 @router.get("/session/{session_id}/status")
 async def get_session_status(session_id: str):
     """Get current session status and QR code"""
+    print("\n" + "=" * 80)
+    print(f"📡 GET /session/{session_id}/status called")
+    print("=" * 80)
     if session_id in active_sessions:
+        print("Found session in active_sessions")
         return active_sessions[session_id]
     try:
+        print("Querying Supabase for session status...")
         result = supabase.table("whatsapp_sessions").select("*").eq("id", session_id).single().execute()
+        print("Supabase query result:", result.data)
         if result.data:
             return {
                 "session_id": session_id,
@@ -162,7 +174,7 @@ def fetch_customer_details(org_id: str, phone: str):
             .limit(1)
             .execute()
         )
-
+        print("🧾 Supabase bills query result:", res.data)
         if res.data and len(res.data) > 0:
             customer = res.data[0]
             name = customer.get("name")
@@ -257,6 +269,7 @@ async def send_whatsapp(request: Request):
     org_id = body.get("org_id")
     phone = body.get("phone")
     text = body.get("message")
+    print(f"➡️ Preparing to send message to phone: {phone} for org_id: {org_id}")
 
     if not org_id or not phone or not text:
         raise HTTPException(status_code=400, detail="org_id, phone, and message are required")
@@ -269,11 +282,13 @@ async def send_whatsapp(request: Request):
 
     if not res.data:
         raise HTTPException(status_code=404, detail="No WhatsApp session found for this org_id")
-
+    print("✅ Session found in Supabase.")
     session_info = res.data[0]
+    print("➡️ Session Info:", session_info)
     session_id = session_info.get("id")
+    print(f"➡️ Session ID: {session_id}")
     status = session_info.get("status")
-
+    print(f"➡️ Session status: {status}")
     if status != "connected":
         raise HTTPException(status_code=400, detail="WhatsApp session is not connected")
 
@@ -292,7 +307,7 @@ async def send_whatsapp(request: Request):
             )
             print("📤 Node.js Response:", response.status_code, await response.aread())
             response.raise_for_status()
-
+            print("✅ Message sent successfully via Node.js service.")
             # ✅ Now pass org_id so we can fetch and store customer details
             store_message(session_id, phone, text, sender, org_id)
 
@@ -326,10 +341,13 @@ async def disconnect_session(session_id: str):
     try:
         async with httpx.AsyncClient() as client:
             # ✅ Ask Node.js service to disconnect & delete session folder
+            print("➡️ Requesting Node.js service to disconnect session...")
+            print(f"URL: {WHATSAPP_SERVICE_URL}/session/{session_id}/disconnect")
             response = await client.post(
                 f"{WHATSAPP_SERVICE_URL}/session/{session_id}/disconnect",
                 timeout=10.0
             )
+            print("📤 Node.js disconnect response:", response.status_code, await response.aread())
             if response.status_code != 200:
                 print(f"⚠️ Node.js disconnect failed: {response.text}")
     except Exception as e:
@@ -420,7 +438,9 @@ async def whatsapp_webhook(webhook: WhatsAppWebhook):
 
         # 2️⃣ Extract message content and sender info
         message_obj = data.get("message", {})
+        print(f"💬 Message object: {message_obj}")
         message_type = message_obj.get("type", "unknown")
+        print(f"💬 Message type: {message_type}")
         message_text = message_obj.get("text", "")
         is_from_me = data.get("fromMe", False)
         sender = "res_owner" if is_from_me else "res_customer"
@@ -479,10 +499,14 @@ async def whatsapp_webhook(webhook: WhatsAppWebhook):
 @router.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """WebSocket connection for real-time updates"""
+    print("🔌 New WebSocket connection request")
     await websocket.accept()
+    print("✅ WebSocket connection accepted")
     websocket_connections.add(websocket)
+    print(f"🌐 Total WebSocket connections: {len(websocket_connections)}")
     try:
         await websocket.send_json({"type": "connected", "message": "WebSocket connected"})
+        print("➡️ Entering WebSocket receive loop")
         while True:
             data = await websocket.receive_text()
             await websocket.send_json({"type": "pong", "data": data})
@@ -492,6 +516,7 @@ async def websocket_endpoint(websocket: WebSocket):
 # ============= HEALTH CHECK =============
 @router.get("/health")
 async def health():
+    print("🔍 Health check requested")
     return {
         "status": "ok",
         "active_sessions": len(active_sessions),

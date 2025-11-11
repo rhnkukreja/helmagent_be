@@ -1,11 +1,12 @@
 import os
 import uuid
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Set
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException, Request
 from pydantic import BaseModel
 import httpx
+import requests
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from llm_responses import generate_followup_message
@@ -93,15 +94,12 @@ def save_message_to_db(session_id: str, msg_data: dict):
 @router.post("/session/start")
 async def start_session(request: StartSessionRequest):
     """Start a new WhatsApp session and generate QR"""
-    print("Starting new WhatsApp session...")
-    print(request.org_id)
     session_id = request.org_id
-
+    print(f"Starting WhatsApp session for org_id: {session_id}")
     async with httpx.AsyncClient() as client:
-        print(f"Requesting Node.js service to start session {session_id} ...")
         try:
-            print("Sending request to Node.js service...")
-            print(f"URL: {WHATSAPP_SERVICE_URL}/session/start")
+            url = f"{WHATSAPP_SERVICE_URL}/session/start"  # fixed
+            print("➡️ Requesting:", url)
             response = await client.post(
                 f"{WHATSAPP_SERVICE_URL}/session/start",
                 json={"session_id": session_id},
@@ -112,7 +110,6 @@ async def start_session(request: StartSessionRequest):
         except Exception as e:
             print(f"Error starting WA session: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to start WA session: {str(e)}")
-    print("Node.js service started session successfully.")
     active_sessions[session_id] = {
         "user_id": request.org_id,
         "status": "initializing",
@@ -120,7 +117,6 @@ async def start_session(request: StartSessionRequest):
         "phone": None,
         "created_at": datetime.utcnow()
     }
-    print("Active sessions:", active_sessions.keys())
     save_session_to_db(session_id, request.org_id, "initializing")
 
     return {
@@ -130,18 +126,15 @@ async def start_session(request: StartSessionRequest):
     }
 
 @router.get("/session/{session_id}/status")
+
 async def get_session_status(session_id: str):
-    """Get current session status and QR code"""
-    print("\n" + "=" * 80)
-    print(f"📡 GET /session/{session_id}/status called")
-    print("=" * 80)
+    print(f"Fetching status for session: {session_id}")
     if session_id in active_sessions:
-        print("Found session in active_sessions")
         return active_sessions[session_id]
     try:
         print("Querying Supabase for session status...")
         result = supabase.table("whatsapp_sessions").select("*").eq("id", session_id).single().execute()
-        print("Supabase query result:", result.data)
+        
         if result.data:
             return {
                 "session_id": session_id,
@@ -149,6 +142,7 @@ async def get_session_status(session_id: str):
                 "qr": result.data.get("qr_code"),
                 "phone": result.data.get("phone_number")
             }
+        
     except:
         pass
     raise HTTPException(status_code=404, detail="Session not found")
@@ -369,128 +363,157 @@ async def disconnect_session(session_id: str):
 
 
 # ============= WEBHOOK =============
-@router.post("/webhook")
-async def whatsapp_webhook(webhook: WhatsAppWebhook):
-    """Receive events from WhatsApp service"""
-    session_id = webhook.session_id
-    event = webhook.event
-    data = webhook.data
+# ============= WEBHOOK (MULTI-ENDPOINT VERSION) =============
+from fastapi import BackgroundTasks
 
-    print(f"📥 Webhook received: {event} for session {session_id}")
-    print(data)
+# ✅ QR READY EVENT
+@router.post("/webhook/qr")
+async def whatsapp_qr(webhook: WhatsAppWebhook):
+    """Handle QR code generation events"""
+    session_id = webhook.session_id
+    data = webhook.data
+    print(f"📥 [QR] Webhook received for session {session_id}")
 
     if session_id not in active_sessions:
         active_sessions[session_id] = {
             "user_id": "unknown",
-            "status": "unknown",
-            "qr": None,
-            "phone": None
-        }
-
-    session = active_sessions[session_id]
-
-    if event == "qr_ready":
-        session.update({"status": "qr_ready", "qr": data.get("qr")})
-        save_session_to_db(session_id, session["user_id"], "qr_ready", qr=data.get("qr"))
-        await broadcast_to_websockets({
-            "type": "qr_update",
-            "session_id": session_id,
+            "status": "qr_ready",
             "qr": data.get("qr")
-        })
+        }
+    else:
+        active_sessions[session_id].update({"status": "qr_ready", "qr": data.get("qr")})
 
-    elif event == "connected":
-        session.update({"status": "connected", "phone": data.get("phone"), "qr": None})
-        save_session_to_db(session_id, session["user_id"], "connected", phone=data.get("phone"))
-        await broadcast_to_websockets({
-            "type": "connected",
-            "session_id": session_id,
-            "phone": data.get("phone"),
-            "name": data.get("name")
-        })
+    save_session_to_db(session_id, active_sessions[session_id]["user_id"], "qr_ready", qr=data.get("qr"))
 
-    elif event == "disconnected":
-        session["status"] = "disconnected"
-        save_session_to_db(session_id, session["user_id"], "disconnected")
-        await broadcast_to_websockets({
-            "type": "disconnected",
-            "session_id": session_id
-        })
+    await broadcast_to_websockets({
+        "type": "qr_update",
+        "session_id": session_id,
+        "qr": data.get("qr"),
+        "expires_in": data.get("expires_in", 60)
+    })
 
-    elif event == "message_received":
-        print("\n" + "=" * 60)
-        print(f"📩 Incoming message event for session: {session_id}")
-        print(f"🔹 Raw data: {data}")
+    print(f"✅ QR event processed for {session_id}")
+    return {"success": True}
 
-        # 1️⃣ Extract and normalize phone number
-        phone_raw = data.get("from", "")
-        phone = phone_raw.replace("@s.whatsapp.net", "").replace("+", "").strip()
-        if phone.startswith("91") and len(phone) > 10:
-            phone = phone[-10:]  # take the last 10 digits
 
-        print(f"📞 Normalized incoming phone: {phone}")
-        print(f"📞 Extracted phone: {phone}")
+# ✅ CONNECTED EVENT
+@router.post("/webhook/connected")
+async def whatsapp_connected(webhook: WhatsAppWebhook):
+    """Handle WhatsApp connection established events"""
+    session_id = webhook.session_id
+    data = webhook.data
+    phone = data.get("phone")
+    name = data.get("name", "User")
 
+    print(f"✅ [Connected] {session_id} — {phone} ({name})")
+
+    if session_id not in active_sessions:
+        active_sessions[session_id] = {"status": "connected", "phone": phone}
+    else:
+        active_sessions[session_id].update({"status": "connected", "phone": phone, "qr": None})
+
+    save_session_to_db(session_id, active_sessions[session_id].get("user_id", ""), "connected", phone=phone)
+
+    await broadcast_to_websockets({
+        "type": "connected",
+        "session_id": session_id,
+        "phone": phone,
+        "name": name
+    })
+
+    return {"success": True}
+
+
+# ✅ DISCONNECTED EVENT
+@router.post("/webhook/disconnect")
+async def whatsapp_disconnected(webhook: WhatsAppWebhook):
+    """Handle WhatsApp disconnection events"""
+    session_id = webhook.session_id
+    reason = webhook.data.get("reason", "unknown")
+
+    print(f"⚠️ [Disconnected] {session_id} — Reason: {reason}")
+
+    if session_id in active_sessions:
+        del active_sessions[session_id]
+
+    save_session_to_db(session_id, "", "disconnected")
+
+    await broadcast_to_websockets({
+        "type": "disconnected",
+        "session_id": session_id,
+        "reason": reason
+    })
+
+    print(f"✅ Disconnected event processed for {session_id}")
+    return {"success": True}
+
+
+# ✅ MESSAGE RECEIVED EVENT
+@router.post("/webhook/message")
+async def whatsapp_message(webhook: WhatsAppWebhook, background_tasks: BackgroundTasks):
+    """Handle incoming WhatsApp messages"""
+    session_id = webhook.session_id
+    data = webhook.data
+
+    print(f"\n💬 [Message] Webhook received for session: {session_id}")
+    print(f"🔹 Data: {data}")
+
+    # 1️⃣ Normalize phone number
+    phone_raw = data.get("from", "")
+    phone = phone_raw.replace("@s.whatsapp.net", "").replace("+", "").strip()
+    if phone.startswith("91") and len(phone) > 10:
+        phone = phone[-10:]
+    phone_full = f"91{phone}" if not phone.startswith("91") else phone
+
+    # 2️⃣ Extract message content
+    message_obj = data.get("message", {})
+    message_text = message_obj.get("text", "")
+    is_from_me = data.get("fromMe", False)
+    sender = "res_owner" if is_from_me else "res_customer"
+
+    print(f"👤 Sender: {sender} | 💬 Message: {message_text}")
+
+    # 3️⃣ Check if conversation exists
+    conv = supabase.table("conversations").select("message_list").eq("session_id", session_id).eq("phone", int(phone)).single().execute()
+    if not conv.data:
+        print(f"🚫 No conversation found for {phone}")
+        return {"success": True, "message": "No conversation found"}
+
+    # 4️⃣ Store message
+    store_message(session_id, int(phone), message_text, sender)
+
+    # 5️⃣ Fetch and update conversation
+    message_list = conv.data.get("message_list", [])
+    message_list.append({sender: message_text})
+
+    # 6️⃣ AI follow-up in background (non-blocking)
+    async def handle_ai_followup():
         try:
-            phone_int = int(phone)
-        except ValueError:
-            print(f"⚠️ Invalid phone format: {phone}")
-            return {"success": False, "message": "Invalid phone format"}
+            from llm_responses import generate_followup_message
+            new_message = await generate_followup_message(message_list)
 
-        # 2️⃣ Extract message content and sender info
-        message_obj = data.get("message", {})
-        print(f"💬 Message object: {message_obj}")
-        message_type = message_obj.get("type", "unknown")
-        print(f"💬 Message type: {message_type}")
-        message_text = message_obj.get("text", "")
-        is_from_me = data.get("fromMe", False)
-        sender = "res_owner" if is_from_me else "res_customer"
+            print(f"🤖 AI generated follow-up: {new_message}")
 
-        print(f"✉️ Message type: {message_type}")
-        print(f"👤 Sender: {'Restaurant' if is_from_me else 'Customer'}")
-        print(f"💬 Message text: {message_text}")
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{WHATSAPP_SERVICE_URL}/session/{session_id}/send",
+                    json={"to": phone_full, "text": new_message},
+                    timeout=15.0
+                )
+                print(f"📤 Node.js send response: {response.status_code}")
 
-        # 3️⃣ Check if conversation exists
-        print(f"🔎 Checking if conversation exists for phone={phone_int}, session={session_id} ...")
-        conv = supabase.table("conversations").select("message_list").eq("session_id", session_id).eq("phone", phone_int).single().execute()
+            store_message(session_id, int(phone), new_message, "res_owner")
 
-        if not conv.data:
-            print(f"🚫 No conversation found for phone {phone_int}. Ignoring message.")
-            return {"success": True, "message": "Ignored - no conversation found"}
+            await broadcast_to_websockets({
+                "type": "new_message",
+                "session_id": session_id,
+                "message": {"text": new_message, "sender": "res_owner"}
+            })
+        except Exception as e:
+            print(f"❌ Error generating/sending AI follow-up: {e}")
 
-        print(f"✅ Found existing conversation. Storing message...")
-        store_message(session_id, phone_int, message_text, sender)
-
-        # 4️⃣ Fetch existing conversation history
-        message_list = conv.data.get("message_list", [])
-        message_list.append({"res_customer": message_text})
-        print(f"🗂️ Current conversation history: {message_list}")
-        # 5️⃣ Generate AI follow-up message (using your LLM)
-        new_message = await generate_followup_message(message_list)
-
-        # 6️⃣ Send via Node.js WhatsApp service
-        print(f"🚀 Sending AI follow-up message to {phone_int} ...")
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{WHATSAPP_SERVICE_URL}/session/{session_id}/send",
-                json={"to": str(phone_int), "text": new_message},
-                timeout=15.0
-            )
-            print(f"📤 Node.js send response: {response.status_code}, {await response.aread()}")
-
-        # 7️⃣ Store AI message in Supabase
-        store_message(session_id, phone_int, new_message, "res_owner")
-        print(f"✅ Follow-up message stored successfully!")
-
-        # 8️⃣ Notify frontend via websocket
-        await broadcast_to_websockets({
-            "type": "new_message",
-            "session_id": session_id,
-            "message": {"text": new_message, "sender": "res_owner"}
-        })
-
-        print("=" * 60 + "\n")
-
-
+    background_tasks.add_task(handle_ai_followup)
+    print(f"✅ Incoming message processed for {phone}")
     return {"success": True}
 
 
@@ -505,7 +528,7 @@ async def websocket_endpoint(websocket: WebSocket):
     websocket_connections.add(websocket)
     print(f"🌐 Total WebSocket connections: {len(websocket_connections)}")
     try:
-        await websocket.send_json({"type": "connected", "message": "WebSocket connected"})
+        await websocket.send_json({"type": "connection_ack", "message": "WebSocket connected"})
         print("➡️ Entering WebSocket receive loop")
         while True:
             data = await websocket.receive_text()
@@ -515,6 +538,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
 # ============= HEALTH CHECK =============
 @router.get("/health")
+
 async def health():
     print("🔍 Health check requested")
     return {

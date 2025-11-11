@@ -20,7 +20,7 @@ from llm_responses import extract_text_from_image, extract_text_from_html, gener
 from utils import store_in_supabase
 import requests
 from routes_whatsapp import router as whatsapp_router
-
+from memory_logger import log_memory_usage   
 # -------------------- Configuration --------------------
 # Load environment variables or hardcode for testing
 load_dotenv()
@@ -58,6 +58,7 @@ app.include_router(whatsapp_router)
 
 
 @app.post("/process-bill/")
+@log_memory_usage
 async def process_bill(
     file: UploadFile = File(...),
     org_id: str = Form(...),
@@ -179,6 +180,7 @@ async def process_bill(
 
 
 @app.get("/dashboard/{org_id}")
+@log_memory_usage
 async def get_dashboard_data(org_id: str):
     try:
         print("Fetching organization for org_id:", org_id)
@@ -265,6 +267,7 @@ async def get_dashboard_data(org_id: str):
 
 
 @app.get("/bills/{org_id}")
+@log_memory_usage
 async def get_bills(org_id: str):
     """
     Fetch customer bills from Supabase for a specific organization.
@@ -316,6 +319,7 @@ import json
 
 
 @app.post("/generate-auth-link")
+@log_memory_usage
 async def generate_auth_link(org_id: str = Form(...)):
     try:
         if not org_id:
@@ -379,6 +383,7 @@ async def generate_auth_link(org_id: str = Form(...)):
 
 
 @app.post("/whatsapp/callback")
+@log_memory_usage
 async def whatsapp_callback(request: Request):
     """
     Webhook endpoint that receives notifications from Unipile 
@@ -455,6 +460,7 @@ async def whatsapp_callback(request: Request):
 
 
 @app.get("/whatsapp/status/{org_id}")
+@log_memory_usage
 async def get_whatsapp_status(org_id: str):
     res = supabase.table("whatsapp_connections").select("*").eq("org_id", org_id).execute()
     
@@ -510,6 +516,7 @@ class GenerateMessageRequest(BaseModel):
 
 
 @app.post("/generate-message")
+@log_memory_usage
 async def generate_message(request: GenerateMessageRequest):
     """
     Generate personalized WhatsApp message using AI based on customer order data
@@ -935,6 +942,7 @@ from typing import Any, Dict
 
 
 @app.post("/generate-send-followup")
+@log_memory_usage
 async def generate_and_send_response(request: Request) -> Dict[str, Any]:
     """
     Webhook handler:
@@ -1041,6 +1049,7 @@ async def generate_and_send_response(request: Request) -> Dict[str, Any]:
 
 
 @app.get("/conversations/{org_id}")
+@log_memory_usage
 async def get_conversations(org_id: str):
     """
     Step 1: Fetch account_id from whatsapp_connections using org_id.
@@ -1186,6 +1195,7 @@ class GoogleReviewLinkRequest(BaseModel):
 
 
 @app.post("/settings/save-google-review")
+@log_memory_usage
 async def save_google_review_link(request: GoogleReviewLinkRequest):
     """
     Save or update the Google Review link for the organization
@@ -1235,31 +1245,36 @@ async def save_google_review_link(request: GoogleReviewLinkRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/settings/google-review/{org_id}")
+@log_memory_usage
 async def get_google_review_link(org_id: str):
     """
     Fetch the saved Google Review link for an organization.
-    Returns 404 if not found or link is empty.
+    Returns a message if the link is None or empty instead of 404 error.
     """
     try:
-        # ✅ Fetch google_review_link for this org_id
         response = supabase.table("organizations") \
             .select("google_review_link") \
             .eq("org_id", org_id) \
             .execute()
-
+        
         if not response.data:
-            raise HTTPException(status_code=404, detail="Organization not found")
-
+            return {"message": "Organization not found", "link": None}
+        
         review_link = response.data[0].get("google_review_link")
-
+        
         if not review_link:
-            raise HTTPException(status_code=404, detail="No review link found")
-
+            return {"message": "No review link found", "link": None}
+        
         return {"link": review_link}
-
+    
     except Exception as e:
         print("❌ Error fetching review link:", e)
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"message": "Internal server error", "error": str(e)}
+
+
+@app.head("/")
+def root():
+    return {"status": "ok"}
 
 # --- ROOT ENDPOINT ---
 @app.get("/")

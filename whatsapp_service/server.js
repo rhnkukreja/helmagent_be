@@ -18,7 +18,8 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const PORT = process.env.PORT || 3001;
+const PORT = 3001; // always run internally
+
 const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:8000';
 
 // Active in-memory sessions map
@@ -88,82 +89,78 @@ async function connectToWhatsApp(sessionId, sessionInfo) {
 
   sessionInfo.socket = sock;
 
-  /* ------------------------------------------------------------
-     CONNECTION UPDATES
-  ------------------------------------------------------------ */
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update;
+/* ------------------------------------------------------------
+   CONNECTION UPDATES with QR timeout + no infinite retry
+------------------------------------------------------------ */
+    const MAX_RETRIES = 1;
+    const QR_VALIDITY_MS = 60000; // 60 seconds
 
-    if (qr) {
-      try {
-        const qrImage = await qrcode.toDataURL(qr);
-        sessionInfo.qr = qrImage;
-        sessionInfo.status = 'qr_ready';
-        console.log(`[${sessionId}] ✅ QR ready, scan to connect`);
-        await notifyBackend(sessionId, 'qr_ready', { qr: qrImage });
-      } catch (err) {
-        console.error(`[${sessionId}] QR generation error:`, err);
-      }
-    }
+    sock.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect, qr } = update;
 
-    if (connection === 'open') {
-      sessionInfo.status = 'connected';
-      sessionInfo.qr = null;
-      sessionInfo.retries = 0;
+      // 🔹 Send QR only once and make it expire
+      if (qr && !sessionInfo.qr) {
+        try {
+          const qrImage = await qrcode.toDataURL(qr);
+          sessionInfo.qr = qrImage;
+          sessionInfo.status = 'qr_ready';
+          sessionInfo.qr_expiry = Date.now() + QR_VALIDITY_MS;
+          console.log(`[${sessionId}] ✅ QR ready — valid for 60s`);
 
-      if (isFirstConnection) {
-        connectionTimestamp = Math.floor(Date.now() / 1000);
-        isFirstConnection = false;
-      }
+          await notifyBackend(sessionId, 'qr_ready', {
+            qr: qrImage,
+            expires_in: QR_VALIDITY_MS / 1000
+          });
 
-      const phoneNumber = sock.user?.id?.split(':')[0] || 'unknown';
-      const userName = sock.user?.name || sock.user?.verifiedName || 'User';
-      sessionInfo.phone = phoneNumber;
-
-      console.log(`[${sessionId}] ✅ Connected as ${phoneNumber} (${userName})`);
-
-      try {
-        await saveCreds();
-      } catch (err) {
-        console.error(`[${sessionId}] ❌ Error saving creds on open:`, err);
+          // ⏰ Expire QR automatically after 60 seconds
+          setTimeout(() => {
+            if (Date.now() > sessionInfo.qr_expiry && sessionInfo.status !== 'connected') {
+              console.log(`[${sessionId}] ⏱️ QR expired after 60s`);
+              sessionInfo.qr = null;
+              sessionInfo.status = 'expired';
+              notifyBackend(sessionId, 'disconnected', { reason: 'qr_expired' });
+            }
+          }, QR_VALIDITY_MS);
+        } catch (err) {
+          console.error(`[${sessionId}] QR generation error:`, err);
+        }
       }
 
-      await notifyBackend(sessionId, 'connected', {
-        phone: phoneNumber,
-        name: userName
-      });
-    }
+      if (connection === 'open') {
+        sessionInfo.status = 'connected';
+        sessionInfo.qr = null;
+        sessionInfo.retries = 0;
+        const phoneNumber = sock.user?.id?.split(':')[0] || 'unknown';
+        const userName = sock.user?.name || sock.user?.verifiedName || 'User';
+        sessionInfo.phone = phoneNumber;
+        console.log(`[${sessionId}] ✅ Connected as ${phoneNumber} (${userName})`);
+        await notifyBackend(sessionId, 'connected', { phone: phoneNumber, name: userName });
+      }
 
-    if (connection === 'close') {
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const reason = lastDisconnect?.error?.output?.payload?.error || 'unknown';
-      console.log(`[${sessionId}] ⚠️ Connection closed. Status=${statusCode}, Reason=${reason}`);
+      if (connection === 'close') {
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const reason = lastDisconnect?.error?.output?.payload?.error || 'unknown';
+        console.log(`[${sessionId}] ⚠️ Connection closed. Status=${statusCode}, Reason=${reason}`);
 
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      if (shouldReconnect) {
-        sessionInfo.retries++;
-        if (sessionInfo.retries <= 5) {
-          console.log(`[${sessionId}] 🔄 Reconnecting... (${sessionInfo.retries}/5)`);
+        // ⛔ Remove infinite reconnect loop
+        if (sessionInfo.retries >= MAX_RETRIES) {
+          console.log(`[${sessionId}] ❌ Max retries reached (${MAX_RETRIES}).`);
+          sessions.delete(sessionId);
+          await notifyBackend(sessionId, 'disconnected', { reason: 'max_retries' });
+        } else {
+          sessionInfo.retries++;
+          console.log(`[${sessionId}] 🔁 Retry ${sessionInfo.retries}/${MAX_RETRIES}...`);
           setTimeout(() => {
             if (sessions.has(sessionId)) connectToWhatsApp(sessionId, sessionInfo);
           }, 3000);
-        } else {
-          console.log(`[${sessionId}] ❌ Max retries reached.`);
-          sessions.delete(sessionId);
-          await notifyBackend(sessionId, 'disconnected', { reason: 'max_retries' });
         }
-      } else {
-        console.log(`[${sessionId}] 🔓 Logged out manually.`);
-        sessions.delete(sessionId);
-        await notifyBackend(sessionId, 'disconnected', { reason: 'logged_out' });
       }
-    }
 
-    if (connection === 'connecting') {
-      sessionInfo.status = 'connecting';
-      console.log(`[${sessionId}] 🔄 Connecting...`);
-    }
-  });
+      if (connection === 'connecting') {
+        sessionInfo.status = 'connecting';
+        console.log(`[${sessionId}] 🔄 Connecting...`);
+      }
+    });
 
   /* ------------------------------------------------------------
      CREDS + KEYS UPDATES

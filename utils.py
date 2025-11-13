@@ -18,11 +18,11 @@ def store_in_supabase(extracted_data: dict):
         record = {
             "name": extracted_data.get("name", ""),
             "contact_number": extracted_data.get("contact_number", ""),
-            "items_ordered": json.dumps(extracted_data.get("items_ordered", [])),
+            "items_ordered": extracted_data.get("items_ordered", []),
             # expect date as 'YYYY-MM-DD' or empty string
             "bill_date": extracted_data.get("date") or None,
             # store numeric total - if missing, store None/0.0 depending on your preference
-            "total_amount": extracted_data.get("total_amount") if extracted_data.get("total_amount") not in (None, "", 0) else None,
+            "total_amount": extracted_data.get("total_amount", ""), 
             # keep org_id if present
             "org_id": extracted_data.get("org_id", None),
         }

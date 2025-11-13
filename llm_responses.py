@@ -1,26 +1,28 @@
 import os
 import json
-from openai import OpenAI
+from openai import AsyncOpenAI
 from dotenv import load_dotenv
 from fastapi import HTTPException
+from fastapi.responses import JSONResponse
+
 
 load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-client = OpenAI(api_key=OPENAI_API_KEY)
 
-
-def extract_text_from_image(image_bytes: bytes) -> dict:
+# ============================================================
+# 🧠 Extract Text from Image (Async)
+# ============================================================
+async def extract_text_from_image(image_base64: str) -> dict:
     """
     Uses GPT-4 Vision to extract structured data (name, contact_number, items_ordered, date, total_amount)
     from an image of a bill or invoice.
     Returns dict with keys: name, contact_number, items_ordered (list), date (YYYY-MM-DD), total_amount (float).
     """
     try:
-        print("Processing image with GPT-4 Vision...")
-
-        response = client.chat.completions.create(
+        response = await client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {
@@ -47,10 +49,14 @@ def extract_text_from_image(image_bytes: bytes) -> dict:
                             - Ignore restaurant or merchant names, phone numbers, GST numbers, invoice numbers, and cashier names.
                             - Only extract the *customer's* name and phone number if explicitly shown (like “Customer Name”, “Bill To”, or “Contact No”).
                             - If no customer name or contact number is present, leave those fields empty.
+                            - If there is any currency symbol (₹, $, etc.) in prices, dont remove it — keep it as is.
                             - Always include `items_ordered`, `date`, and `total_amount` if visible.
                             - Return ONLY JSON — no extra text."""
                         },
-                        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + image_bytes.decode()}},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}
+                        },
                     ],
                 },
             ],
@@ -58,24 +64,24 @@ def extract_text_from_image(image_bytes: bytes) -> dict:
         )
 
         raw_output = response.choices[0].message.content.strip()
-        print("Raw GPT Output:", raw_output)
 
-        # Clean up any markdown-style JSON fences (just in case)
+        # Clean up any markdown-style JSON fences
         if raw_output.startswith("```"):
-            raw_output = raw_output.strip("`")
-            if "json" in raw_output:
-                raw_output = raw_output.replace("json", "", 1).strip()
-        
-        result = json.loads(raw_output)
-        print("Extracted Data:", result)
+            raw_output = raw_output.strip("`").replace("json", "", 1).strip()
 
+        result = json.loads(raw_output)
+       
         return result
 
     except Exception as e:
-        print("Error extracting text:", str(e))
+        print("❌ Error extracting text from image:", str(e))
         raise HTTPException(status_code=500, detail=f"GPT-4 Vision error: {str(e)}")
 
-def extract_text_from_html(html_content: str) -> dict:
+
+# ============================================================
+# 🌐 Extract Text from HTML (Async)
+# ============================================================
+async def extract_text_from_html(html_content: str) -> dict:
     """
     Uses GPT-4 to extract structured data (name, contact_number, items_ordered, date, total_amount)
     from an uploaded HTML bill file.
@@ -83,7 +89,7 @@ def extract_text_from_html(html_content: str) -> dict:
     try:
         print("Processing HTML with GPT-4...")
 
-        response = client.chat.completions.create(
+        response = await client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {
@@ -113,13 +119,11 @@ def extract_text_from_html(html_content: str) -> dict:
                             ⚠️ Rules:
                             - Ignore restaurant info, GST, invoice no., and cashier name.
                             - Focus only on customer details, items, date, and total.
+                            - If there is any currency symbol (₹, $, etc.) in prices, dont remove it — keep it as is.
                             - If any field is missing, leave it blank or empty.
                             - Output ONLY pure JSON (no markdown, no commentary)."""
                         },
-                        {
-                            "type": "text",
-                            "text": html_content,
-                        },
+                        {"type": "text", "text": html_content},
                     ],
                 },
             ],
@@ -127,33 +131,30 @@ def extract_text_from_html(html_content: str) -> dict:
         )
 
         raw_output = response.choices[0].message.content.strip()
-        print("Raw GPT Output (HTML):", raw_output)
 
-        # 🧹 Clean up markdown fences if GPT returns ```json blocks
+        # Clean up markdown fences
         if raw_output.startswith("```"):
-            raw_output = raw_output.strip("`")
-            if "json" in raw_output:
-                raw_output = raw_output.replace("json", "", 1).strip()
+            raw_output = raw_output.strip("`").replace("json", "", 1).strip()
 
         result = json.loads(raw_output)
-        print("Extracted HTML Data:", result)
-
         return result
 
     except Exception as e:
-        print("Error extracting text from HTML:", str(e))
+        print("❌ Error extracting text from HTML:", str(e))
         raise HTTPException(status_code=500, detail=f"GPT-4 HTML extraction error: {str(e)}")
 
 
-
+# ============================================================
+# 💬 Generate WhatsApp Follow-up Message (Async)
+# ============================================================
 async def generate_followup_message(message_list):
     """
     Generate a contextual WhatsApp follow-up message based on previous AI messages and customer order data
     """
     try:
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("🤖 GENERATING FOLLOW-UP MESSAGE")
-        
+
         prompt = f"""
             You are a restaurant manager at The Corner Cafe replying to a customer's recent WhatsApp message.
 
@@ -198,30 +199,26 @@ async def generate_followup_message(message_list):
             - Do not explain or label the mood.
             - The message should sound natural, like a real restaurant manager writing it personally.
             3. Never return any refunds or compensation other than the 30% discount for BAD mood.
+        """
 
-            """
-                  # Call OpenAI API
-        response = client.chat.completions.create(
+        response = await client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {
                     "role": "system",
                     "content": "You are a friendly restaurant manager following up with customers on WhatsApp. Write human-like, engaging, and caring messages that sound personal."
                 },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
+                {"role": "user", "content": prompt},
             ],
             temperature=0.8,
-            max_tokens=300
+            max_tokens=300,
         )
 
         ai_message = response.choices[0].message.content.strip()
 
         print(f"\n✅ Follow-up AI Message Generated:")
         print(ai_message)
-        print("="*60 + "\n")
+        print("=" * 60 + "\n")
 
         return ai_message
 
@@ -230,8 +227,7 @@ async def generate_followup_message(message_list):
         return JSONResponse(
             content={
                 "success": False,
-                "error": f"Failed to generate follow-up message: {str(e)}"
+                "error": f"Failed to generate follow-up message: {str(e)}",
             },
-            status_code=500
+            status_code=500,
         )
-

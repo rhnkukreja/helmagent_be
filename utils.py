@@ -30,7 +30,6 @@ def store_in_supabase(extracted_data: dict):
         response = supabase.table("bills").insert(record).execute()
 
         if response.data:
-            print("Data stored successfully:", response.data)
             return response.data
         else:
             raise Exception(str(response))

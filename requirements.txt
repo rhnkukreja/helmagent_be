@@ -10,3 +10,4 @@ httpx
 pydantic
 aiofiles
 psutil
+razorpay

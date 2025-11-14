@@ -24,6 +24,7 @@ import asyncio
 from llm_responses import extract_text_from_image, extract_text_from_html
 from utils import store_in_supabase  # kept for fallback / single-record paths
 from routes_whatsapp import router as whatsapp_router
+from routes_razorpay import router as razorpay_router
 from memory_logger import log_memory_usage
 
 # -------------------------------------------------------
@@ -50,7 +51,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(whatsapp_router)
-
+app.include_router(razorpay_router)
 # ---------- QUEUE & WORKERS ----------
 processing_queue: asyncio.Queue = asyncio.Queue()
 NUM_WORKERS = int(os.getenv("NUM_WORKERS", "5"))      # tune per OpenAI tier
@@ -581,7 +582,7 @@ class GenerateMessageRequest(BaseModel):
     phone: str
     items_ordered: str
     order_date: str
-    total_amount: float
+    total_amount: str
 
 
 @app.post("/generate-message")
@@ -599,7 +600,7 @@ async def generate_message(request: GenerateMessageRequest):
         print(f"Phone: {request.phone}")
         print(f"Items: {request.items_ordered}")
         print(f"Date: {request.order_date}")
-        print(f"Amount: ₹{request.total_amount}")
+        print(f"Amount: {request.total_amount}")
         rest_name = get_restaurant_name(request.org_id)
 
         prompt = f"""

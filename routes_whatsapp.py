@@ -75,22 +75,6 @@ def save_session_to_db(session_id: str, org_id: str, status: str, qr: str = None
     except Exception as e:
         print(f"DB Error: {e}")
 
-def save_message_to_db(session_id: str, msg_data: dict):
-    """Save message to Supabase"""
-    try:
-        supabase.table("messages").insert({
-            "id": str(uuid.uuid4()),
-            "session_id": session_id,
-            "whatsapp_message_id": msg_data.get("id"),
-            "from_number": msg_data.get("from"),
-            "is_from_me": msg_data.get("fromMe", False),
-            "message_type": msg_data.get("message", {}).get("type", "text"),
-            "message_text": msg_data.get("message", {}).get("text", ""),
-            "timestamp": datetime.fromtimestamp(int(msg_data.get("timestamp", 0))).isoformat(),
-            "created_at": datetime.utcnow().isoformat()
-        }).execute()
-    except Exception as e:
-        print(f"DB Error saving message: {e}")
 
 # ============= ENDPOINTS =============
 
@@ -339,42 +323,72 @@ async def get_messages(session_id: str, limit: int = 50):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/session/{session_id}/disconnect")
-async def disconnect_session(session_id: str):
+@router.post("/webhook/whatsapp")
+async def whatsapp_webhook_handler(webhook: WhatsAppWebhook):
     """
-    Disconnect WhatsApp session and clean up credentials in Node.js + Supabase
+    Generic webhook handler for Node.js events.
+    Node.js ALWAYS posts to: /webhook/whatsapp
     """
-    print(f"🔌 Disconnecting WhatsApp session: {session_id}")
+    print(f"📩 General WhatsApp webhook: {webhook.event}")
 
+    if webhook.event == "qr_ready":
+        return await whatsapp_qr(webhook)
+
+    if webhook.event == "connected":
+        return await whatsapp_connected(webhook)
+
+    if webhook.event == "disconnected":
+        return await whatsapp_disconnected(webhook)
+
+    if webhook.event == "message_received":
+        return await whatsapp_message(webhook)
+
+    print(f"⚠️ Unknown event: {webhook.event}")
+    return {"success": False, "error": "Unknown event"}
+
+@router.post("/session/{session_id}/disconnect")
+async def disconnect_whatsapp(session_id: str):
+    """
+    Proper WhatsApp disconnect:
+    1. Tell Node to remove session from memory
+    2. Clear Supabase auth_data & status
+    """
+    print(f"🔹 Disconnecting WhatsApp session: {session_id}")
+
+    # 1️⃣ Tell Node.js to disconnect the WhatsApp socket
     try:
         async with httpx.AsyncClient() as client:
-            # ✅ Ask Node.js service to disconnect & delete session folder
-            print("➡️ Requesting Node.js service to disconnect session...")
-            print(f"URL: {WHATSAPP_SERVICE_URL}/session/{session_id}/disconnect")
-            response = await client.post(
+            node_res = await client.post(
                 f"{WHATSAPP_SERVICE_URL}/session/{session_id}/disconnect",
                 timeout=10.0
             )
-            print("📤 Node.js disconnect response:", response.status_code, await response.aread())
-            if response.status_code != 200:
-                print(f"⚠️ Node.js disconnect failed: {response.text}")
-    except Exception as e:
-        print(f"❌ Error disconnecting Node.js session: {e}")
+            print("🔌 Node disconnect:", node_res.status_code, node_res.text)
+    except Exception as err:
+        print(f"⚠️ Node disconnect failed (not fatal): {err}")
 
-    # ✅ Remove session from memory
-    if session_id in active_sessions:
-        del active_sessions[session_id]
-        print(f"🧹 Removed {session_id} from active_sessions")
-
-    # ✅ Update Supabase to reflect disconnection
+    # 2️⃣ Clear Supabase session (auth_data + status)
     try:
-        save_session_to_db(session_id, "", "disconnected")
-        print(f"✅ Updated Supabase session {session_id} to 'disconnected'")
+        update_res = supabase.table("whatsapp_sessions").update(
+            {
+                "status": "disconnected",
+                "auth_data": None,
+                "qr_code": None,
+                "phone_number": None,
+                "updated_at": datetime.utcnow().isoformat()
+            }
+        ).eq("id", session_id).execute()
+
+        print(f"🧹 Supabase updated:", update_res.data)
+
     except Exception as e:
-        print(f"⚠️ Failed to update Supabase: {e}")
+        print(f"❌ Supabase update error:", e)
+        return {"success": False, "error": str(e)}
 
-    return {"success": True, "message": "Session disconnected and cleaned up"}
-
+    return {
+        "success": True,
+        "message": "WhatsApp session disconnected successfully",
+        "session_id": session_id
+    }
 
 # ============= WEBHOOK =============
 # ============= WEBHOOK (MULTI-ENDPOINT VERSION) =============
@@ -508,6 +522,9 @@ async def whatsapp_message(webhook: WhatsAppWebhook, background_tasks: Backgroun
 
     # 1️⃣ Normalize phone number
     phone_raw = data.get("from", "")
+    if "@g.us" in phone_raw:
+        print("⚠ Group message detected — skipping conversation lookup")
+        return {"success": True}
     phone = phone_raw.replace("@s.whatsapp.net", "").replace("+", "").strip()
     if phone.startswith("91") and len(phone) > 10:
         phone = phone[-10:]

@@ -726,21 +726,7 @@ async def get_conversations(org_id: str):
     """
     try:
         # Step 1 — get account_id
-        """ 
-        connection = (
-            supabase.table("whatsapp_connections")
-            .select("account_id")
-            .eq("org_id", org_id)
-            .single()
-            .execute()
-        )
 
-        if not connection.data or not connection.data.get("account_id"):
-            raise HTTPException(status_code=404, detail="No WhatsApp connection found for this organization")
-
-        account_id = connection.data["account_id"]
-        print("account_id:", account_id)
-        """
         session_id = org_id
         # Step 2 — fetch conversations
         response = (
@@ -785,79 +771,6 @@ async def get_conversations(org_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching conversations: {str(e)}")
 
-"""
-@app.post("/disconnect")
-async def disconnect_whatsapp(request: Request):
-    
-    Disconnect a WhatsApp account:
-    - Fetches the account_id from Supabase.
-    - Calls Unipile DELETE API to remove the connection.
-    - Clears account_id and status in Supabase.
-    
-    try:
-        body = await request.json()
-        org_id = body.get("org_id")
-
-        if not org_id:
-            raise HTTPException(status_code=400, detail="Missing org_id")
-
-        print(f"🔹 Disconnecting WhatsApp for org_id: {org_id}")
-
-        # 1️⃣ Fetch the account_id from Supabase
-        res = supabase.table("whatsapp_connections").select("account_id").eq("org_id", org_id).execute()
-        if not res.data or not res.data[0].get("account_id"):
-            raise HTTPException(status_code=404, detail="No WhatsApp account linked for this organization")
-
-        account_id = res.data[0]["account_id"]
-        print(f"✅ Found account_id: {account_id}")
-
-        # 2️⃣ Call Unipile DELETE API
-        delete_url = f"{UNIPILE_BASE_URL}/api/v1/accounts/{account_id}"
-        headers = {
-            "accept": "application/json",
-            "X-API-KEY": UNIPILE_API_KEY,
-        }
-
-        print(f"🔸 Sending DELETE to {delete_url}")
-        response = requests.delete(delete_url, headers=headers)
-
-        if response.status_code not in [200, 204]:
-            print(f"❌ Failed to delete account from Unipile: {response.text}")
-            raise HTTPException(
-                status_code=response.status_code,
-                detail=f"Unipile delete failed: {response.text}"
-            )
-
-        print(f"🗑️ Unipile account deleted successfully.")
-
-        # 3️⃣ Update Supabase — clear account_id & status
-        update_res = supabase.table("whatsapp_connections").upsert(
-            {
-                "org_id": org_id,
-                "account_id": "",
-                "status": "",
-                "last_updated_at": datetime.utcnow().isoformat()
-            },
-            on_conflict="org_id"
-        ).execute()
-
-        print(f"🧹 Supabase updated successfully: {update_res.data}")
-
-        return {
-            "success": True,
-            "message": "WhatsApp account disconnected successfully",
-            "org_id": org_id
-        }
-
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        print(f"❌ Error disconnecting WhatsApp: {e}")
-        return {
-            "success": False,
-            "error": str(e)
-        }
-"""
 class GoogleReviewLinkRequest(BaseModel):
     org_id: str
     link: str

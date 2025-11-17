@@ -17,6 +17,9 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 WHATSAPP_SERVICE_URL = os.getenv("WHATSAPP_SERVICE_URL", "http://localhost:3001")
 
+
+
+
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY")
 
@@ -299,6 +302,17 @@ async def send_whatsapp(request: Request):
                 json={"to": formatted_phone, "text": text},
                 timeout=10.0
             )
+
+            # Add error handling
+            try:
+                response = await client.post(...)
+                print(f"Response status: {response.status_code}")
+                print(f"Response body: {response.text}")  # ← Log this!
+            except httpx.TimeoutException:
+                print("❌ Timeout! Node.js service took too long to respond")
+            except Exception as e:
+                print(f"❌ Error: {str(e)}")
+
             print("📤 Node.js Response:", response.status_code, await response.aread())
             response.raise_for_status()
             print("✅ Message sent successfully via Node.js service.")
@@ -448,6 +462,40 @@ async def whatsapp_disconnected(webhook: WhatsAppWebhook):
     return {"success": True}
 
 
+def format_whatsapp_message(llm_response: str) -> str:
+    """
+    Dynamically format LLM response for WhatsApp readability.
+    Breaks long text into chunks, adds line breaks, preserves links.
+    """
+    import re
+    
+    # Split into sentences while preserving links
+    sentences = re.split(r'(?<=[.!?])\s+', llm_response)
+    
+    formatted_lines = []
+    buffer = ""
+    
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        
+        # If buffer + sentence > 100 chars, flush buffer
+        if len(buffer) + len(sentence) > 100 and buffer:
+            formatted_lines.append(buffer)
+            buffer = sentence
+        else:
+            buffer += " " + sentence if buffer else sentence
+    
+    if buffer:
+        formatted_lines.append(buffer)
+    
+    # Join with double line breaks
+    formatted = "\n\n".join(formatted_lines)
+    
+    return formatted
+
+
 # ✅ MESSAGE RECEIVED EVENT
 @router.post("/webhook/message")
 async def whatsapp_message(webhook: WhatsAppWebhook, background_tasks: BackgroundTasks):
@@ -486,28 +534,43 @@ async def whatsapp_message(webhook: WhatsAppWebhook, background_tasks: Backgroun
     message_list = conv.data.get("message_list", [])
     message_list.append({sender: message_text})
 
+    print("HERE IS THE MESSAGE LIST")
+    print(message_list)
+    print("==============================================================================================================")
+    print("==============================================================================================================")
+    print("==============================================================================================================")
+    # the messages from the entire chat will go to the LLM and then the LLM will create the new message, so we need to see what exactly is 
+    # going into the LLM and the Prompt to the LLm and then tweak the prompt of the LLM
+
+
     # 6️⃣ AI follow-up in background (non-blocking)
     async def handle_ai_followup():
         try:
-            from llm_responses import generate_followup_message
-            new_message = await generate_followup_message(message_list)
+            # fetch the restaurant_name and the google_review_link to be sent to the LLM for the followup message generation
+            # user_id = supabase.table('whatsapp_sessions').select('user_id').eq('phone_number', phone_full).execute().data[0]['user_id']
+            # org_data = supabase.table('organizations').select('name, google_review_link').eq('org_id', user_id).execute().data[0]
+            # restaurant_name, google_review_link = org_data['name'], org_data['google_review_link']
+            restaurant_name, google_review_link ="Rohan's Rest", "my-restaurant-link"
 
-            print(f"🤖 AI generated follow-up: {new_message}")
+
+            new_message = await generate_followup_message(message_list, restaurant_name, google_review_link)
+            formatted_new_message=format_whatsapp_message(new_message)
+            print(f"🤖 AI generated follow-up: {formatted_new_message}")
 
             async with httpx.AsyncClient() as client:
                 response = await client.post(
                     f"{WHATSAPP_SERVICE_URL}/session/{session_id}/send",
-                    json={"to": phone_full, "text": new_message},
+                    json={"to": phone_full, "text": formatted_new_message},
                     timeout=15.0
                 )
                 print(f"📤 Node.js send response: {response.status_code}")
 
-            store_message(session_id, int(phone), new_message, "res_owner")
+            store_message(session_id, int(phone), formatted_new_message, "res_owner")
 
             await broadcast_to_websockets({
                 "type": "new_message",
                 "session_id": session_id,
-                "message": {"text": new_message, "sender": "res_owner"}
+                "message": {"text": formatted_new_message, "sender": "res_owner"}
             })
         except Exception as e:
             print(f"❌ Error generating/sending AI follow-up: {e}")

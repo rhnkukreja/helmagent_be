@@ -147,87 +147,48 @@ async def extract_text_from_html(html_content: str) -> dict:
 # ============================================================
 # 💬 Generate WhatsApp Follow-up Message (Async)
 # ============================================================
-async def generate_followup_message(message_list):
-    """
-    Generate a contextual WhatsApp follow-up message based on previous AI messages and customer order data
-    """
+async def generate_followup_message(message_list, restaurant_name, google_review_link):
+    """Generate contextual WhatsApp follow-up with correct Sir/Ma'am."""
     try:
         print("\n" + "=" * 60)
         print("🤖 GENERATING FOLLOW-UP MESSAGE")
 
-        prompt = f"""
-            You are a restaurant manager at The Corner Cafe replying to a customer's recent WhatsApp message.
-
-            Conversation History:
-            {message_list}
-
-            Your task:
-            1. Read the entire conversation and understand the tone, especially the latest customer message.
-            2. Analyze the tone to detect the customer's mood:
-            - If they sound happy, satisfied, thankful, or positive → mood = GOOD
-            - If they sound disappointed, mention poor service, bad food, delay, or complain → mood = BAD
-
-            Now follow these rules based on the detected mood:
-
-            🔹 If mood = GOOD:
-            - Address the person as "Sir" or "Ma'am" (never use their name).
-            - Write a short, warm thank-you message for their kind words.
-            - Politely ask them to share their experience on Google Reviews and include a link placeholder like:
-                👉 https://maps.app.goo.gl/yPpFNAig6KkrN3YdA
-            - Also generate 2–3 short sample reviews (each ≤ 30 words) that they can post directly.
-            - Keep tone cheerful, appreciative, and authentic (use 1–2 emojis max).
-            - End politely (e.g., “Looking forward to serving you again soon!”).
-
-            🔹 If mood = BAD:
-            - Address the person as "Sir" or "Ma'am" (never use their name).
-            - Gently apologize for their unpleasant experience.
-            - Acknowledge what went wrong (e.g., food quality, service delay, or general disappointment).
-            - Offer them a 30% discount on their next visit and encourage them to give you another chance.
-            - Keep tone empathetic, sincere, and caring (1 emoji max).
-            - End politely (e.g., “We truly hope to make your next visit delightful.”).
-
-            ⚙️ Additional Context-Aware Behavior:
-            - Read the conversation carefully before replying.
-            - If the customer has *already acknowledged or agreed to post a review* (e.g., messages like “surely will do that”, “already did”, “posted”, “done”, or similar),
-              then do NOT repeat the Google Review link or sample reviews.
-              Instead, simply thank them warmly for their support and express appreciation (1 emoji max).
-            - The reply should feel natural and context-aware — avoid repetition or robotic tone.
-
-            Formatting:
-            - Keep the entire message between 80–120 words.
-            - Return only the WhatsApp message text.
-            - Do not explain or label the mood.
-            - The message should sound natural, like a real restaurant manager writing it personally.
-            3. Never return any refunds or compensation other than the 30% discount for BAD mood.
-        """
-
+        # Detect gender
+        gender = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": f"Is customer male/female? Respond: male/female/unknown\n\n{message_list}"}],
+            temperature=0.0,
+            max_tokens=5,
+        )
+        salutation = "Ma'am" if "female" in gender.choices[0].message.content.lower() else "Sir"
+        
+        # Generate response
         response = await client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a friendly restaurant manager following up with customers on WhatsApp. Write human-like, engaging, and caring messages that sound personal."
+                    "content": f"You're a manager at {restaurant_name}. Use only '{salutation}'. Be warm, human-like. 80-120 words."
                 },
-                {"role": "user", "content": prompt},
+                {
+                    "role": "user",
+                    "content": f"""Conversation: {message_list}
+
+If GOOD mood → thank them, ask review ({google_review_link}) unless already agreed, 2-3 sample reviews
+If BAD mood → apologize, offer 30% discount
+If NEUTRAL → answer their question
+
+Use '{salutation}' only. No names. One message only."""
+                },
             ],
-            temperature=0.8,
-            max_tokens=300,
+            temperature=0.85,
+            max_tokens=250,
         )
-
+        
         ai_message = response.choices[0].message.content.strip()
-
-        print(f"\n✅ Follow-up AI Message Generated:")
-        print(ai_message)
-        print("=" * 60 + "\n")
-
+        print(f"\n✅ Message: {ai_message}\n" + "=" * 60 + "\n")
         return ai_message
-
+        
     except Exception as e:
-        print(f"\n❌ Error generating follow-up message: {str(e)}")
-        return JSONResponse(
-            content={
-                "success": False,
-                "error": f"Failed to generate follow-up message: {str(e)}",
-            },
-            status_code=500,
-        )
+        print(f"❌ Error: {str(e)}")
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)

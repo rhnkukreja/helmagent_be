@@ -37,3 +37,19 @@ def store_in_supabase(extracted_data: dict):
     except Exception as e:
         print("Error storing in Supabase:", str(e))
         raise HTTPException(status_code=500, detail=f"Supabase error: {str(e)}")
+
+def update_contact_status(org_id: str, phone: str):
+    print(f"📌 Updating contact status for phone={phone}, org_id={org_id}")
+
+    try:
+        # Try to update the record
+        result = supabase.table("bills") \
+            .update({"status": True}) \
+            .eq("contact_number", phone) \
+            .eq("org_id", org_id) \
+            .execute()
+
+        print("✅ Contact status updated:", result.data)
+
+    except Exception as e:
+        print(f"❌ Failed to update contact status: {str(e)}")

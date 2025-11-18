@@ -25,7 +25,7 @@ from llm_responses import extract_text_from_image, extract_text_from_html
 from utils import store_in_supabase  # kept for fallback / single-record paths
 from routes_whatsapp import router as whatsapp_router
 from routes_razorpay import router as razorpay_router
-from memory_logger import log_memory_usage
+from memory_logger import log_memory_usage_to_file
 
 # -------------------------------------------------------
 load_dotenv()
@@ -211,7 +211,7 @@ async def process_sub_job(sub_job: dict):
 # -------------------------------------------------------
 # ---------- ENDPOINTS ----------
 @app.post("/process-bill/")
-@log_memory_usage
+@log_memory_usage_to_file
 async def process_bill(
     files: List[UploadFile] = File(...),
     org_id: str = Form(...),
@@ -360,7 +360,7 @@ async def process_bill(
     return JSONResponse(content={"status": "success", "files_processed": len(results), "details": results})
 
 @app.get("/queue-status/{job_id}")
-@log_memory_usage
+@log_memory_usage_to_file
 async def get_queue_status(job_id: str):
     """Poll any job (parent ZIP or sub-job)."""
     if job_id not in job_status:
@@ -395,7 +395,7 @@ async def get_queue_status(job_id: str):
 
 
 @app.get("/dashboard/{org_id}")
-@log_memory_usage
+@log_memory_usage_to_file
 async def get_dashboard_data(org_id: str):
     try:
         print("Fetching organization for org_id:", org_id)
@@ -482,7 +482,7 @@ async def get_dashboard_data(org_id: str):
 
 
 @app.get("/bills/{org_id}")
-@log_memory_usage
+@log_memory_usage_to_file
 async def get_bills(org_id: str):
     """
     Fetch customer bills from Supabase for a specific organization.
@@ -530,7 +530,7 @@ import traceback
 import json
 
 @app.get("/whatsapp/status/{org_id}")
-@log_memory_usage
+@log_memory_usage_to_file
 async def get_whatsapp_status(org_id: str):
     res = supabase.table("whatsapp_connections").select("*").eq("org_id", org_id).execute()
     
@@ -586,7 +586,7 @@ class GenerateMessageRequest(BaseModel):
 
 
 @app.post("/generate-message")
-@log_memory_usage
+@log_memory_usage_to_file
 async def generate_message(request: GenerateMessageRequest):
     """
     Generate personalized WhatsApp message using AI based on customer order data
@@ -717,7 +717,7 @@ from fastapi import FastAPI, Request
 from typing import Any, Dict
 
 @app.get("/conversations/{org_id}")
-@log_memory_usage
+@log_memory_usage_to_file
 async def get_conversations(org_id: str):
     """
     Step 1: Fetch account_id from whatsapp_connections using org_id.
@@ -777,7 +777,7 @@ class GoogleReviewLinkRequest(BaseModel):
 
 
 @app.post("/settings/save-google-review")
-@log_memory_usage
+@log_memory_usage_to_file
 async def save_google_review_link(request: GoogleReviewLinkRequest):
     """
     Save or update the Google Review link for the organization
@@ -827,7 +827,7 @@ async def save_google_review_link(request: GoogleReviewLinkRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/settings/google-review/{org_id}")
-@log_memory_usage
+@log_memory_usage_to_file
 async def get_google_review_link(org_id: str):
     """
     Fetch the saved Google Review link for an organization.

@@ -10,6 +10,7 @@ import requests
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from llm_responses import generate_followup_message
+from utils import update_contact_status
 # ============= CONFIG =============
 load_dotenv()
 
@@ -53,7 +54,7 @@ async def broadcast_to_websockets(message: dict):
     websocket_connections.difference_update(dead_connections)
 
 # ============= DATABASE HELPERS =============
-def save_session_to_db(session_id: str, org_id: str, status: str, qr: str = None, phone: str = None):
+def save_session_to_db(session_id: str, org_id: str, status: str, phone: str = None):
     """Save or update session in Supabase"""
     try:
         existing = supabase.table("whatsapp_sessions").select("id").eq("id", session_id).execute()
@@ -63,8 +64,6 @@ def save_session_to_db(session_id: str, org_id: str, status: str, qr: str = None
             "status": status,
             "updated_at": datetime.utcnow().isoformat()
         }
-        if qr:
-            data["qr_code"] = qr
         if phone:
             data["phone_number"] = phone
         if existing.data:
@@ -302,7 +301,7 @@ async def send_whatsapp(request: Request):
             print("✅ Message sent successfully via Node.js service.")
             # ✅ Now pass org_id so we can fetch and store customer details
             store_message(session_id, phone, text, sender, org_id)
-
+            update_contact_status(org_id, phone)
             return {"success": True, "data": response.json()}
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to send message: {str(e)}")
@@ -342,6 +341,9 @@ async def whatsapp_webhook_handler(webhook: WhatsAppWebhook):
 
     if webhook.event == "message_received":
         return await whatsapp_message(webhook)
+
+    if webhook.event == "user_logout":
+        return await whatsapp_user_logout(webhook)
 
     print(f"⚠️ Unknown event: {webhook.event}")
     return {"success": False, "error": "Unknown event"}
@@ -404,14 +406,13 @@ async def whatsapp_qr(webhook: WhatsAppWebhook):
 
     if session_id not in active_sessions:
         active_sessions[session_id] = {
-            "user_id": "unknown",
-            "status": "qr_ready",
-            "qr": data.get("qr")
+            "user_id": session_id,
+            "status": "qr_ready"
         }
     else:
-        active_sessions[session_id].update({"status": "qr_ready", "qr": data.get("qr")})
+        active_sessions[session_id].update({"status": "qr_ready"})
 
-    save_session_to_db(session_id, active_sessions[session_id]["user_id"], "qr_ready", qr=data.get("qr"))
+    save_session_to_db(session_id, active_sessions[session_id]["user_id"], "qr_ready")
 
     await broadcast_to_websockets({
         "type": "qr_update",
@@ -438,9 +439,9 @@ async def whatsapp_connected(webhook: WhatsAppWebhook):
     if session_id not in active_sessions:
         active_sessions[session_id] = {"status": "connected", "phone": phone}
     else:
-        active_sessions[session_id].update({"status": "connected", "phone": phone, "qr": None})
+        active_sessions[session_id].update({"status": "connected", "phone": phone})
 
-    save_session_to_db(session_id, active_sessions[session_id].get("user_id", ""), "connected", phone=phone)
+    save_session_to_db(session_id, active_sessions[session_id].get("user_id", "session_id"), "connected", phone=phone)
 
     await broadcast_to_websockets({
         "type": "connected",
@@ -522,9 +523,10 @@ async def whatsapp_message(webhook: WhatsAppWebhook, background_tasks: Backgroun
 
     # 1️⃣ Normalize phone number
     phone_raw = data.get("from", "")
-    if "@g.us" in phone_raw:
+    if "@s.whatsapp.net" not in phone_raw:
         print("⚠ Group message detected — skipping conversation lookup")
         return {"success": True}
+
     phone = phone_raw.replace("@s.whatsapp.net", "").replace("+", "").strip()
     if phone.startswith("91") and len(phone) > 10:
         phone = phone[-10:]
@@ -551,11 +553,6 @@ async def whatsapp_message(webhook: WhatsAppWebhook, background_tasks: Backgroun
     message_list = conv.data.get("message_list", [])
     message_list.append({sender: message_text})
 
-    print("HERE IS THE MESSAGE LIST")
-    print(message_list)
-    print("==============================================================================================================")
-    print("==============================================================================================================")
-    print("==============================================================================================================")
     # the messages from the entire chat will go to the LLM and then the LLM will create the new message, so we need to see what exactly is 
     # going into the LLM and the Prompt to the LLm and then tweak the prompt of the LLM
 
@@ -597,7 +594,54 @@ async def whatsapp_message(webhook: WhatsAppWebhook, background_tasks: Backgroun
     return {"success": True}
 
 
+@router.post("/webhook/user-logout")
+async def whatsapp_user_logout(request: Request):
+    """Handles logout initiated directly from WhatsApp (device removed)."""
+    body = await request.json()
+    print("📡 [USER LOGOUT WEBHOOK] Received:", body)
 
+    session_id = body.get("session_id")
+    data = body.get("data", {})
+    reason = data.get("reason", "unknown")
+    message = data.get("message", "User logged out")
+
+    try:
+        # Update session status in database
+        supabase.table("whatsapp_sessions")\
+            .update({
+                "user_id": "",
+                "status": "logged_out",
+                "auth_data": None,
+                "phone_number": None
+            })\
+            .eq("id", session_id)\
+            .execute()
+
+        print(f"✅ Session {session_id} marked as logged out in database")
+
+        # Broadcast to all connected WebSocket clients
+        await broadcast_to_websockets({
+            "type": "user_logout",
+            "session_id": session_id,
+            "status": "logged_out",
+            "reason": reason,
+            "message": message,
+            "timestamp": data.get("timestamp")
+        })
+
+        print(f"📢 Broadcasted logout notification to WebSocket clients")
+
+        return {
+            "received": True,
+            "message": f"Session {session_id} logout processed successfully"
+        }
+
+    except Exception as e:
+        print(f"❌ Error processing user logout: {e}")
+        return {
+            "received": False,
+            "error": str(e)
+        }
 # ============= WEBSOCKET =============
 @router.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):

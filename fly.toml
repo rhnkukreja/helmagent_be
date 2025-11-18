@@ -1,21 +1,28 @@
-app = "helmagent-be"  # Change this to your app name
-primary_region = "sin"  # Singapore - closest to India, change if needed
+app = "helmagent-be"
+primary_region = "sin"
 
 [build]
   dockerfile = "Dockerfile"
 
 [env]
   PORT = "8000"
+  WORKERS = "4"
 
 [http_service]
   internal_port = 8000
   force_https = true
   auto_stop_machines = true
   auto_start_machines = true
-  min_machines_running = 0
+  min_machines_running = 1
   processes = ["app"]
 
 [[vm]]
   memory = "1gb"
   cpu_kind = "shared"
   cpus = 1
+
+[autoscaling]
+  min_machines = 1
+  max_machines = 5
+  polling_interval = 6
+  metrics = "cpu"

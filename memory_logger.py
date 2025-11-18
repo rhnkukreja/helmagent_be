@@ -1,136 +1,77 @@
-# utils/memory_logger.py
-import os
-import tracemalloc
-from datetime import datetime
-from functools import wraps
-from typing import Callable, Any
-from fastapi import Request
-import logging
-import logging.handlers
 import asyncio
-# ----------------------------------------------------------------------
-# 1. Configure a rotating file handler (max 5 MB, keep 3 backups)
-# ----------------------------------------------------------------------
-LOG_FILE = os.path.join(os.path.dirname(__file__), "memory_logs.txt")
-handler = logging.handlers.RotatingFileHandler(
-    LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
-)
-formatter = logging.Formatter("%(message)s")   # we build the line ourselves
-handler.setFormatter(formatter)
+import functools
+import os
+import psutil
+import threading
+import time
+from datetime import datetime
+from fastapi import Request
 
-memory_logger = logging.getLogger("memory_logger")
-memory_logger.setLevel(logging.INFO)
-memory_logger.addHandler(handler)
-memory_logger.propagate = False   # avoid double logging to console
+LOG_FILE_PATH = "memory_logs.txt"
+PROFILING_INTERVAL = 0.01
 
-
-# ----------------------------------------------------------------------
-# 2. Helper that returns a human-readable size
-# ----------------------------------------------------------------------
-def _sizeof_fmt(num: float, suffix: str = "B") -> str:
-    for unit in ["", "Ki", "Mi", "Gi", "Ti"]:
-        if abs(num) < 1024.0:
-            return f"{num:3.1f}{unit}{suffix}"
-        num /= 1024.0
-    return f"{num:.1f}Pi{suffix}"
-
-
-# ----------------------------------------------------------------------
-# 3. The decorator
-# ----------------------------------------------------------------------
-def log_memory_usage(func: Callable) -> Callable:
+def log_memory_usage_to_file(func):
     """
-    Decorator for FastAPI endpoints.
-    - Starts tracemalloc before the call
-    - Captures memory **before**, **after** and **peak** (max allocated)
-    - Writes ONE line to memory_logs.txt:
-        TIMESTAMP | METHOD PATH | before: X.XX MiB | after: Y.YY MiB | peak: Z.ZZ MiB
+    A decorator that logs memory usage before and after a function call,
+    and also profiles the peak memory usage during the function's execution
+    using a background thread.
     """
-    @wraps(func)
-    async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
-        # --------------------------------------------------------------
-        # Find the FastAPI Request object (it is the first positional arg
-        # for normal endpoints; for WebSocket it is `websocket`)
-        # --------------------------------------------------------------
-        request: Request | None = None
-        for a in args:
-            if isinstance(a, Request):
-                request = a
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        process = psutil.Process(os.getpid())
+        
+        # Try to get the endpoint path for better logging
+        endpoint_info = func.__name__
+        for arg in args:
+            if isinstance(arg, Request):
+                endpoint_info = f"{arg.method} {arg.url.path}"
                 break
+        
+        # --- Profiler thread setup ---
+        stop_event = threading.Event()
+        memory_samples = []
 
-        method_path = "UNKNOWN"
-        if request:
-            method_path = f"{request.method} {request.url.path}"
+        def memory_sampler():
+            """This function runs in a separate thread to sample memory."""
+            while not stop_event.is_set():
+                try:
+                    memory_samples.append(process.memory_info().rss)
+                except Exception:
+                    # In case process info can't be read
+                    pass
+                time.sleep(PROFILING_INTERVAL)
 
-        # --------------------------------------------------------------
-        # Start tracing
-        # --------------------------------------------------------------
-        tracemalloc.start()
-        before = tracemalloc.take_snapshot()
-        before_size = sum(stat.size for stat in before.statistics("lineno"))
+        # --- Execution and Profiling ---
+        mem_before = process.memory_info().rss / (1024 ** 2)
+
+        profiler_thread = threading.Thread(target=memory_sampler, daemon=True)
+        profiler_thread.start()
 
         try:
+            # Await the actual async function
             result = await func(*args, **kwargs)
         finally:
-            # --------------------------------------------------------------
-            # Capture after & peak
-            # --------------------------------------------------------------
-            after = tracemalloc.take_snapshot()
-            after_size = sum(stat.size for stat in after.statistics("lineno"))
-            peak = tracemalloc.get_traced_memory()[1]   # (current, peak)
+            # Stop the profiler thread once the function is done
+            stop_event.set()
+            profiler_thread.join(timeout=1.0)  # Add timeout to prevent hanging
 
-            tracemalloc.stop()
+        mem_after = process.memory_info().rss / (1024 ** 2)
+        
+        # --- Analyze and Log the Results ---
+        peak_mem_usage = max(memory_samples) / (1024 ** 2) if memory_samples else mem_after
+        mem_diff = mem_after - mem_before
 
-            # --------------------------------------------------------------
-            # Build log line
-            # --------------------------------------------------------------
-            ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-            line = (
-                f"{ts} | {method_path} | "
-                f"before: {_sizeof_fmt(before_size)} | "
-                f"after: {_sizeof_fmt(after_size)} | "
-                f"peak: {_sizeof_fmt(peak)}"
-            )
-            memory_logger.info(line)
+        log_entry = (
+            f"[{datetime.utcnow().isoformat()}] [{endpoint_info}] "
+            f"Memory Before: {mem_before:.2f} MB | "
+            f"After: {mem_after:.2f} MB | "
+            f"Diff: {mem_diff:+.2f} MB | "
+            f"Peak during call: {peak_mem_usage:.2f} MB\n"
+        )
 
-        return result
-
-    # ------------------------------------------------------------------
-    # Synchronous endpoints (rare, but we support them)
-    # ------------------------------------------------------------------
-    def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
-        request: Request | None = None
-        for a in args:
-            if isinstance(a, Request):
-                request = a
-                break
-        method_path = f"{request.method} {request.url.path}" if request else "UNKNOWN"
-
-        tracemalloc.start()
-        before = tracemalloc.take_snapshot()
-        before_size = sum(stat.size for stat in before.statistics("lineno"))
-
-        try:
-            result = func(*args, **kwargs)
-        finally:
-            after = tracemalloc.take_snapshot()
-            after_size = sum(stat.size for stat in after.statistics("lineno"))
-            peak = tracemalloc.get_traced_memory()[1]
-
-            tracemalloc.stop()
-
-            ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-            line = (
-                f"{ts} | {method_path} | "
-                f"before: {_sizeof_fmt(before_size)} | "
-                f"after: {_sizeof_fmt(after_size)} | "
-                f"peak: {_sizeof_fmt(peak)}"
-            )
-            memory_logger.info(line)
+        with open(LOG_FILE_PATH, "a") as f:
+            f.write(log_entry)
 
         return result
-
-    # Return the correct wrapper depending on whether the original is async
-    if asyncio.iscoroutinefunction(func):
-        return async_wrapper
-    return sync_wrapper
+    
+    return wrapper

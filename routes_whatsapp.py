@@ -7,6 +7,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException, Re
 from pydantic import BaseModel
 import httpx
 import requests
+from collections import defaultdict
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from llm_responses import generate_followup_message
@@ -29,7 +30,7 @@ router = APIRouter(prefix="/whatsapp", tags=["WhatsApp"])
 
 # ============= IN-MEMORY STORAGE =============
 active_sessions: Dict[str, dict] = {}
-websocket_connections: Set[WebSocket] = set()
+websocket_connections: dict[str, set[WebSocket]] = defaultdict(set)
 
 # ============= MODELS =============
 class StartSessionRequest(BaseModel):
@@ -43,8 +44,9 @@ class WhatsAppWebhook(BaseModel):
     data: dict
 
 # ============= WEBSOCKET HELPER =============
+"""
 async def broadcast_to_websockets(message: dict):
-    """Send message to all connected WebSocket clients"""
+    Send message to all connected WebSocket clients
     dead_connections = set()
     for ws in websocket_connections:
         try:
@@ -52,6 +54,28 @@ async def broadcast_to_websockets(message: dict):
         except:
             dead_connections.add(ws)
     websocket_connections.difference_update(dead_connections)
+"""
+
+async def broadcast_to_org(org_id: str, message: dict):
+    """
+    Send message ONLY to WebSocket clients of a specific org_id
+    """
+    if org_id not in websocket_connections:
+        return
+
+    dead_ws = set()
+    for ws in websocket_connections[org_id].copy():  # .copy() to avoid mutation during iteration
+        try:
+            await ws.send_json(message)
+        except Exception:
+            dead_ws.add(ws)
+
+    # Clean up dead connections
+    for ws in dead_ws:
+        websocket_connections[org_id].discard(ws)
+
+    print(f"Broadcasted to org_id {org_id}: {message.get('type')}")
+
 
 # ============= DATABASE HELPERS =============
 def save_session_to_db(session_id: str, org_id: str, status: str, phone: str = None):
@@ -414,7 +438,7 @@ async def whatsapp_qr(webhook: WhatsAppWebhook):
 
     save_session_to_db(session_id, active_sessions[session_id]["user_id"], "qr_ready")
 
-    await broadcast_to_websockets({
+    await broadcast_to_org(session_id, {
         "type": "qr_update",
         "session_id": session_id,
         "qr": data.get("qr"),
@@ -443,7 +467,7 @@ async def whatsapp_connected(webhook: WhatsAppWebhook):
 
     save_session_to_db(session_id, active_sessions[session_id].get("user_id", "session_id"), "connected", phone=phone)
 
-    await broadcast_to_websockets({
+    await broadcast_to_org(session_id, {
         "type": "connected",
         "session_id": session_id,
         "phone": phone,
@@ -458,6 +482,7 @@ async def whatsapp_connected(webhook: WhatsAppWebhook):
 async def whatsapp_disconnected(webhook: WhatsAppWebhook):
     """Handle WhatsApp disconnection events"""
     session_id = webhook.session_id
+    org_id = session_id
     reason = webhook.data.get("reason", "unknown")
 
     print(f"⚠️ [Disconnected] {session_id} — Reason: {reason}")
@@ -465,9 +490,9 @@ async def whatsapp_disconnected(webhook: WhatsAppWebhook):
     if session_id in active_sessions:
         del active_sessions[session_id]
 
-    save_session_to_db(session_id, "", "disconnected")
+    save_session_to_db(session_id, org_id, "disconnected")
 
-    await broadcast_to_websockets({
+    await broadcast_to_org(session_id, {
         "type": "disconnected",
         "session_id": session_id,
         "reason": reason
@@ -581,7 +606,7 @@ async def whatsapp_message(webhook: WhatsAppWebhook, background_tasks: Backgroun
 
             store_message(session_id, int(phone), formatted_new_message, "res_owner")
 
-            await broadcast_to_websockets({
+            await broadcast_to_org(session_id, {
                 "type": "new_message",
                 "session_id": session_id,
                 "message": {"text": formatted_new_message, "sender": "res_owner"}
@@ -620,7 +645,7 @@ async def whatsapp_user_logout(request: Request):
         print(f"✅ Session {session_id} marked as logged out in database")
 
         # Broadcast to all connected WebSocket clients
-        await broadcast_to_websockets({
+        await broadcast_to_org(session_id, {
             "type": "user_logout",
             "session_id": session_id,
             "status": "logged_out",
@@ -643,22 +668,36 @@ async def whatsapp_user_logout(request: Request):
             "error": str(e)
         }
 # ============= WEBSOCKET =============
-@router.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket connection for real-time updates"""
-    print("🔌 New WebSocket connection request")
+
+@router.websocket("/ws/{org_id}")
+async def websocket_endpoint(websocket: WebSocket, org_id: str):
+    """WebSocket connection for real-time updates — one per restaurant/org"""
+    print(f"New WebSocket connection request for org_id: {org_id}")
     await websocket.accept()
-    print("✅ WebSocket connection accepted")
-    websocket_connections.add(websocket)
-    print(f"🌐 Total WebSocket connections: {len(websocket_connections)}")
+    print(f"WebSocket accepted for org_id: {org_id}")
+
+    # Add this specific restaurant's connection
+    websocket_connections[org_id].add(websocket)
+
     try:
-        await websocket.send_json({"type": "connection_ack", "message": "WebSocket connected"})
-        print("➡️ Entering WebSocket receive loop")
+        # Confirm connection
+        await websocket.send_json({
+            "type": "connection_ack",
+            "message": "WebSocket connected",
+            "org_id": org_id
+        })
+
+        # Keep-alive loop (optional pong)
         while True:
             data = await websocket.receive_text()
             await websocket.send_json({"type": "pong", "data": data})
+
     except WebSocketDisconnect:
-        websocket_connections.remove(websocket)
+        print(f"WebSocket disconnected for org_id: {org_id}")
+        websocket_connections[org_id].discard(websocket)
+    except Exception as e:
+        print(f"WebSocket error for org_id {org_id}: {e}")
+        websocket_connections[org_id].discard(websocket)
 
 # ============= HEALTH CHECK =============
 @router.get("/health")

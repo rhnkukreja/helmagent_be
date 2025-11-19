@@ -9,6 +9,7 @@ import httpx
 import requests
 from collections import defaultdict
 from dotenv import load_dotenv
+
 from supabase import create_client, Client
 from llm_responses import generate_followup_message
 from utils import update_contact_status
@@ -85,6 +86,8 @@ def save_session_to_db(session_id: str, org_id: str, status: str, phone: str = N
         data = {
             "id": session_id,
             "user_id": org_id,
+            "qr_code": None,              
+            "qr_expires_at": None,
             "status": status,
             "updated_at": datetime.utcnow().isoformat()
         }
@@ -436,7 +439,14 @@ async def whatsapp_qr(webhook: WhatsAppWebhook):
     else:
         active_sessions[session_id].update({"status": "qr_ready"})
 
-    save_session_to_db(session_id, active_sessions[session_id]["user_id"], "qr_ready")
+    expires_in = data.get("expires_in", 60)
+    expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
+    supabase.table("whatsapp_sessions").update({
+        "status": "qr_ready",
+        "qr_code": data.get("qr"),
+        "qr_expires_at": expires_at.isoformat(),
+        "updated_at": datetime.utcnow().isoformat()
+    }).eq("id", session_id).execute()
 
     await broadcast_to_org(session_id, {
         "type": "qr_update",

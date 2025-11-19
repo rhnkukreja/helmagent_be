@@ -155,10 +155,9 @@ async def generate_followup_message(message_list, restaurant_name, google_review
 
         # Detect gender
         gender = await client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5-nano",
             messages=[{"role": "user", "content": f"Is customer male/female? Respond: male/female/unknown\n\n{message_list}"}],
-            temperature=0.0,
-            max_tokens=5,
+            max_completion_tokens=5,
         )
         salutation = "Ma'am" if "female" in gender.choices[0].message.content.lower() else "Sir"
         
@@ -174,11 +173,27 @@ async def generate_followup_message(message_list, restaurant_name, google_review
                     "role": "user",
                     "content": f"""Conversation: {message_list}
 
-If GOOD mood → thank them, ask review ({google_review_link}) unless already agreed, 2-3 sample reviews
+
+If the user's latest reply is "1", "2", "one","two" (case-insensitive and irrespctive of language), then:
+→ Do NOT generate a new conversation reply.
+→ Simply return the exact sample review text that corresponds to that number from the previous message.
+→ Output ONLY that text. No extra words, no salutation, no sign-off, nothing else.
+
+Otherwise follow the normal rules:
+
+If GOOD mood → thank them, ask for review and give this review link ({google_review_link}),  also give 2 sample reviews
 If BAD mood → apologize, offer 30% discount
 If NEUTRAL → answer their question
 
-Use '{salutation}' only. No names. One message only."""
+Formatting requirements (MUST follow exactly):
+For GOOD mood include a short numbered list of reviews corresponding exactly to what they've had and reviews increase restaurant's reputation:
+   1.) “First sample review”
+   2.) “Second sample review”
+   Then add this line (exactly): 
+   Select any one number, i will share that with you and you can copy paste
+
+Use '{salutation}' only. No names. One message only.
+"""
                 },
             ],
             temperature=0.85,
@@ -192,3 +207,38 @@ Use '{salutation}' only. No names. One message only."""
     except Exception as e:
         print(f"❌ Error: {str(e)}")
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
+
+
+
+
+if __name__=="__main__":
+    message_list=["""Hello Prateek Sir,
+
+Thank you so much for dining with us at Timshel on October 11, 2025! We hope you enjoyed our flavorful Kadhai Chicken, prepared with a blend of aromatic spices that truly brings out its essence, along with the comforting steam rice. 🍚
+
+We’d love to hear about your experience! Your feedback is invaluable to us as we strive to make every visit memorable.
+
+Looking forward to your thoughts!
+
+Warm regards,
+Timshel Team""",
+"Thank you",
+"""Thank you, Sir! We appreciate your feedback and would love to hear your thoughts on your experience. If you could take a moment to leave a review here: ABCD_link, it would mean a lot to us. 
+
+Here are two sample reviews you might consider:  
+1.) “The Kadhai Chicken was bursting with flavor and cooked to perfection! A must-try!”  
+2.) “The ambiance was delightful, and the steam rice complemented the dish wonderfully.”  
+
+Select any one number (Type 1 or 2), I will share that with you and you can copy paste.
+""",
+"2"
+]
+
+    restaurant_name="ABCD"
+    google_review_link="ABCD_link"
+    import asyncio
+
+    print(asyncio.run(generate_followup_message(message_list, restaurant_name, google_review_link)))
+
+
+

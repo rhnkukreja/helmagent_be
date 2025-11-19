@@ -441,12 +441,15 @@ async def whatsapp_qr(webhook: WhatsAppWebhook):
 
     expires_in = data.get("expires_in", 60)
     expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
+    print("ATTEMPTING STORAGE TO SUPABASE!!!!")
+
     supabase.table("whatsapp_sessions").update({
         "status": "qr_ready",
         "qr_code": data.get("qr"),
         "qr_expires_at": expires_at.isoformat(),
         "updated_at": datetime.utcnow().isoformat()
     }).eq("id", session_id).execute()
+    print("STORED IN SUPABASE!!!!")
 
     await broadcast_to_org(session_id, {
         "type": "qr_update",

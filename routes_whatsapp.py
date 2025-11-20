@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 
 from supabase import create_client, Client
 from llm_responses import generate_followup_message
-from utils import update_contact_status
+from utils import update_contact_status, format_phone_number
 # ============= CONFIG =============
 load_dotenv()
 
@@ -299,10 +299,7 @@ async def send_whatsapp(request: Request):
     if status != "connected":
         raise HTTPException(status_code=400, detail="WhatsApp session is not connected")
 
-    formatted_phone = str(phone).strip()
-    if not formatted_phone.startswith("+91") and not formatted_phone.startswith("91"):
-        formatted_phone = f"91{formatted_phone}"
-    formatted_phone = formatted_phone.lstrip("+")
+    formatted_phone = format_phone_number(org_id, phone)
 
     print(f"🚀 Sending message to Node.js service for phone: {formatted_phone}")
     async with httpx.AsyncClient() as client:
@@ -327,7 +324,7 @@ async def send_whatsapp(request: Request):
             response.raise_for_status()
             print("✅ Message sent successfully via Node.js service.")
             # ✅ Now pass org_id so we can fetch and store customer details
-            store_message(session_id, phone, text, sender, org_id)
+            store_message(session_id, formatted_phone, text, sender, org_id)
             update_contact_status(org_id, phone)
             return {"success": True, "data": response.json()}
         except Exception as e:
@@ -552,83 +549,143 @@ def format_whatsapp_message(llm_response: str) -> str:
 # ✅ MESSAGE RECEIVED EVENT
 @router.post("/webhook/message")
 async def whatsapp_message(webhook: WhatsAppWebhook, background_tasks: BackgroundTasks):
-    """Handle incoming WhatsApp messages"""
+    """Handle incoming WhatsApp messages — ONLY act if conversation already exists"""
     session_id = webhook.session_id
     data = webhook.data
 
-    print(f"\n💬 [Message] Webhook received for session: {session_id}")
-    print(f"🔹 Data: {data}")
+    print(f"\n{'='*60}")
+    print(f"WHATSAPP WEBHOOK RECEIVED | Session: {session_id}")
+    print(f"{'='*60}")
 
-    # 1️⃣ Normalize phone number
-    phone_raw = data.get("from", "")
-    if "@s.whatsapp.net" not in phone_raw:
-        print("⚠ Group message detected — skipping conversation lookup")
+    # ── 1. Extract phone number ─────────────────────────────────────
+    remote_jid = data.get("remoteJid", "")
+    phone = None
+
+    if "@lid" in remote_jid:
+        print("LID message detected → extracting phone from senderPn")
+        raw_data = data.get("raw", {})
+        key_data = raw_data.get("key", {})
+        sender_pn = key_data.get("senderPn", "")
+        
+        if sender_pn and "@s.whatsapp.net" in sender_pn:
+            phone = sender_pn.replace("@s.whatsapp.net", "").replace("+", "").strip()
+            print(f"Phone extracted from senderPn: {phone}")
+        else:
+            print("No valid senderPn found in LID → skipping")
+            return {"success": True}
+
+    elif "@s.whatsapp.net" in remote_jid:
+        phone = remote_jid.replace("@s.whatsapp.net", "").replace("+", "").strip()
+        print(f"Standard WhatsApp user → Phone: {phone}")
+
+    else:
+        print(f"Unsupported JID format: {remote_jid} → ignored (group/broadcast?)")
         return {"success": True}
 
-    phone = phone_raw.replace("@s.whatsapp.net", "").replace("+", "").strip()
-    if phone.startswith("91") and len(phone) > 10:
-        phone = phone[-10:]
-    phone_full = f"91{phone}" if not phone.startswith("91") else phone
+    if not phone:
+        print("Could not extract phone number → dropping message")
+        return {"success": True}
 
-    # 2️⃣ Extract message content
+    # ── 2. Extract message text ─────────────────────────────────────
     message_obj = data.get("message", {})
-    message_text = message_obj.get("text", "")
+    print(f"Raw message object: {message_obj}")
+
+    if isinstance(message_obj, dict):
+        message_text = message_obj.get("text", "") or message_obj.get("conversation", "")
+    elif isinstance(message_obj, str):
+        message_text = message_obj
+    else:
+        message_text = ""
+
+    if not message_text.strip():
+        print("Empty or media-only message → ignoring (no text to process)")
+        return {"success": True}
+
     is_from_me = data.get("fromMe", False)
     sender = "res_owner" if is_from_me else "res_customer"
+    print(f"Incoming message | From: {sender} | Text: '{message_text}'")
 
-    print(f"👤 Sender: {sender} | 💬 Message: {message_text}")
+    # ── 3. Critical Check: Does conversation exist in DB? ───────────
+    print(f"Checking if conversation exists in Supabase for phone: {phone}...")
+    
+    try:
+        conv = supabase.table("conversations") \
+            .select("message_list") \
+            .eq("session_id", session_id) \
+            .eq("phone", int(phone)) \
+            .maybe_single() \
+            .execute()
+    except Exception as e:
+        print(f"Supabase query failed: {e}")
+        return {"success": False, "error": "DB error"}
 
-    # 3️⃣ Check if conversation exists
-    conv = supabase.table("conversations").select("message_list").eq("session_id", session_id).eq("phone", int(phone)).single().execute()
-    if not conv.data:
-        print(f"🚫 No conversation found for {phone}")
-        return {"success": True, "message": "No conversation found"}
+    # ── 4. Main Logic: Only proceed if conversation ALREADY exists ───
+    if not conv or conv.data:
+        print(f"NO CONVERSATION FOUND for {phone}")
+        print(f"→ Message IGNORED (no DB row = staff hasn't replied yet)")
+        print(f"→ No storage, no AI reply, no action taken.")
+        print(f"{'-'*60}")
+        return {"success": True}
 
-    # 4️⃣ Store message
-    store_message(session_id, int(phone), message_text, sender)
+    print(f"CONVERSATION FOUND! Active chat with {phone} → processing message")
 
-    # 5️⃣ Fetch and update conversation
+    # ── 5. Store incoming customer message ───────────────────────────
+    print(f"Storing customer message in DB...")
+    store_message(session_id, int(phone), message_text, "res_customer")
+    print(f"Customer message stored successfully")
+
+    # ── 6. Update message list ───────────────────────────────────────
     message_list = conv.data.get("message_list", [])
-    message_list.append({sender: message_text})
+    message_list.append({"res_customer": message_text})
+    print(f"Message list updated → now has {len(message_list)} messages")
 
-    # the messages from the entire chat will go to the LLM and then the LLM will create the new message, so we need to see what exactly is 
-    # going into the LLM and the Prompt to the LLm and then tweak the prompt of the LLM
+    # ── 7. Trigger AI reply in background ────────────────────────────
+    print(f"Triggering AI reply in background...")
 
-
-    # 6️⃣ AI follow-up in background (non-blocking)
     async def handle_ai_followup():
         try:
-            # fetch the restaurant_name and the google_review_link to be sent to the LLM for the followup message generation
-            # user_id = supabase.table('whatsapp_sessions').select('user_id').eq('phone_number', phone_full).execute().data[0]['user_id']
-            # org_data = supabase.table('organizations').select('name, google_review_link').eq('org_id', user_id).execute().data[0]
-            # restaurant_name, google_review_link = org_data['name'], org_data['google_review_link']
-            restaurant_name, google_review_link ="Rohan's Rest", "my-restaurant-link"
-
-
+            print(f"[AI] Generating reply for {phone}...")
+            restaurant_name, google_review_link = "Rohan's Rest", "my-restaurant-link"
+            
             new_message = await generate_followup_message(message_list, restaurant_name, google_review_link)
-            formatted_new_message=format_whatsapp_message(new_message)
-            print(f"🤖 AI generated follow-up: {formatted_new_message}")
+            formatted = format_whatsapp_message(new_message)
+            
+            print(f"[AI] Generated reply: {formatted}")
 
+            print(f"[WHATSAPP] Sending reply to {phone} via Node.js service...")
             async with httpx.AsyncClient() as client:
                 response = await client.post(
                     f"{WHATSAPP_SERVICE_URL}/session/{session_id}/send",
-                    json={"to": phone_full, "text": formatted_new_message},
-                    timeout=15.0
+                    json={"to": phone, "text": formatted},
+                    timeout=20.0
                 )
-                print(f"📤 Node.js send response: {response.status_code}")
+            
+            if response.status_code == 200:
+                print(f"AI reply sent successfully to {phone}")
+            else:
+                print(f"Failed to send AI reply → status: {response.status_code}")
 
-            store_message(session_id, int(phone), formatted_new_message, "res_owner")
+            # Store AI reply
+            store_message(session_id, int(phone), formatted, "res_owner")
+            print(f"AI reply stored in DB")
 
+            # Broadcast to dashboard
             await broadcast_to_org(session_id, {
                 "type": "new_message",
                 "session_id": session_id,
-                "message": {"text": formatted_new_message, "sender": "res_owner"}
+                "message": {"text": formatted, "sender": "res_owner"}
             })
+            print(f"AI reply broadcasted to dashboard")
+
         except Exception as e:
-            print(f"❌ Error generating/sending AI follow-up: {e}")
+            print(f"AI FOLLOW-UP FAILED for {phone}: {e}")
 
     background_tasks.add_task(handle_ai_followup)
-    print(f"✅ Incoming message processed for {phone}")
+    print(f"AI task queued successfully")
+
+    print(f"INCOMING MESSAGE FULLY PROCESSED for {phone}")
+    print(f"{'='*60}\n")
+
     return {"success": True}
 
 

@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 from fastapi import HTTPException
 load_dotenv()
 
-SUPABASE_KEY=os.getenv("SUPABASE_KEY")
+SUPABASE_KEY=os.getenv("SUPABASE_SERVICE_KEY")
 SUPABASE_URL=os.getenv("SUPABASE_URL")
 
 supabase: Client = create_client(SUPABASE_URL,SUPABASE_KEY)
@@ -53,3 +53,45 @@ def update_contact_status(org_id: str, phone: str):
 
     except Exception as e:
         print(f"❌ Failed to update contact status: {str(e)}")
+
+
+
+def format_phone_number(org_id: str, phone: str):
+    """
+    Fetch country code using org_id and return properly formatted phone number.
+    Removes '+' and spaces and builds: countrycode + phonenumber
+    """
+
+    print(f"➡️ Formatting phone number for org_id: {org_id}, phone: {phone}")
+
+    # Fetch country_code from organizations table
+    org_data = supabase.table("organizations") \
+        .select("country_code") \
+        .eq("org_id", org_id) \
+        .execute()
+
+    print("➡️ Fetched organization data:", org_data.data)
+
+    # --- FIX 1: handle empty result safely ---
+    if not org_data.data or len(org_data.data) == 0:
+        print("⚠️ No organization found. Using default country code +91")
+        country_code = "91"
+    else:
+        # --- FIX 2: org_data.data[0] is the row ---
+        raw_code = org_data.data[0].get("country_code") or "+91"
+        print(f"➡️ Raw country code from DB: {raw_code}")
+
+        # Clean the country code
+        country_code = raw_code.strip().lstrip("+")
+
+    print(f"➡️ Cleaned country code: {country_code}")
+
+    # Clean incoming phone number
+    clean_phone = str(phone).strip().replace(" ", "").lstrip("+")
+    print(f"➡️ Cleaned phone: {clean_phone}")
+
+    # Build final WhatsApp-ready number
+    formatted = f"{country_code}{clean_phone}"
+    print(f"📱 Final formatted phone: {formatted}")
+
+    return formatted

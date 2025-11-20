@@ -267,68 +267,124 @@ def store_message(session_id, phone, message, sender, org_id=None):
         print(f"❌ Error storing message: {e}")
         return None
 
-
 @router.post("/send-whatsapp")
 async def send_whatsapp(request: Request):
-    """Send WhatsApp message using org_id (same as session id)"""
-    body = await request.json()
-    print("\n📩 Incoming Request Body:", body)
-    org_id = body.get("org_id")
-    phone = body.get("phone")
-    text = body.get("message")
-    print(f"➡️ Preparing to send message to phone: {phone} for org_id: {org_id}")
+    """Send WhatsApp message with 3 Retries on Failure"""
+    
+    # 🛡️ MASTER TRY/CATCH BLOCK
+    try:
+        body = await request.json()
+        print("\n📩 Incoming Request Body:", body)
+        
+        org_id = body.get("org_id")
+        phone = body.get("phone")
+        text = body.get("message")
+        
+        print(f"➡️ Preparing to send message to phone: {phone} for org_id: {org_id}")
 
-    if not org_id or not phone or not text:
-        raise HTTPException(status_code=400, detail="org_id, phone, and message are required")
+        # Validation
+        if not org_id or not phone or not text:
+            raise HTTPException(status_code=400, detail="org_id, phone, and message are required")
 
-    sender = "res_owner"
-    print(f"➡️ Checking session in Supabase for org_id: {org_id}")
+        sender = "res_owner"
+        
+        # Database Lookup
+        res = supabase.table("whatsapp_sessions").select("id, status").eq("id", org_id).execute()
+        
+        if not res.data:
+            raise HTTPException(status_code=404, detail="No WhatsApp session found for this org_id")
+        
+        session_info = res.data[0]
+        session_id = session_info.get("id")
+        status = session_info.get("status")
+        
+        if status != "connected":
+            raise HTTPException(status_code=400, detail="WhatsApp session is not connected")
 
-    res = supabase.table("whatsapp_sessions").select("id, status").eq("id", org_id).execute()
-    print("🧾 Supabase Result:", res.data)
-
-    if not res.data:
-        raise HTTPException(status_code=404, detail="No WhatsApp session found for this org_id")
-    print("✅ Session found in Supabase.")
-    session_info = res.data[0]
-    print("➡️ Session Info:", session_info)
-    session_id = session_info.get("id")
-    print(f"➡️ Session ID: {session_id}")
-    status = session_info.get("status")
-    print(f"➡️ Session status: {status}")
-    if status != "connected":
-        raise HTTPException(status_code=400, detail="WhatsApp session is not connected")
-
-    formatted_phone = format_phone_number(org_id, phone)
-
-    print(f"🚀 Sending message to Node.js service for phone: {formatted_phone}")
-    async with httpx.AsyncClient() as client:
+        # Formatting
         try:
-            response = await client.post(
-                f"{WHATSAPP_SERVICE_URL}/session/{session_id}/send",
-                json={"to": formatted_phone, "text": text},
-                timeout=10.0
-            )
+            formatted_phone = format_phone_number(org_id, phone)
+        except Exception as format_error:
+            raise HTTPException(status_code=400, detail=f"Invalid phone format: {str(format_error)}")
 
-            # Add error handling
-            try:
-                response = await client.post(...)
-                print(f"Response status: {response.status_code}")
-                print(f"Response body: {response.text}")  # ← Log this!
-            except httpx.TimeoutException:
-                print("❌ Timeout! Node.js service took too long to respond")
-            except Exception as e:
-                print(f"❌ Error: {str(e)}")
+        print(f"🚀 Connecting to Node.js service...")
+        
+        # ============================================================
+        # 🔄 RETRY LOGIC STARTS HERE
+        # ============================================================
+        max_retries = 3
+        last_exception = None
+        response_data = None
 
-            print("📤 Node.js Response:", response.status_code, await response.aread())
-            response.raise_for_status()
-            print("✅ Message sent successfully via Node.js service.")
-            # ✅ Now pass org_id so we can fetch and store customer details
-            store_message(session_id, formatted_phone, text, sender, org_id)
-            update_contact_status(org_id, phone)
-            return {"success": True, "data": response.json()}
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to send message: {str(e)}")
+        async with httpx.AsyncClient() as client:
+            for attempt in range(1, max_retries + 1):
+                try:
+                    print(f"⏳ Attempt {attempt}/{max_retries}: Sending to Node.js...")
+                    
+                    response = await client.post(
+                        f"{WHATSAPP_SERVICE_URL}/session/{session_id}/send",
+                        json={"to": formatted_phone, "text": text},
+                        timeout=30.0 
+                    )
+                    
+                    # Read response to ensure we got data
+                    response_text = await response.aread()
+                    
+                    # If status is 400-499 (Client Error), do NOT retry (it won't fix itself)
+                    if 400 <= response.status_code < 500:
+                        print(f"❌ Client Error {response.status_code}: {response_text}")
+                        response.raise_for_status()
+
+                    # If status is 500+ or OK, check status
+                    response.raise_for_status()
+
+                    # ✅ SUCCESS!
+                    print(f"✅ Success on attempt {attempt}. Node Response: {response.status_code}")
+                    response_data = response.json()
+                    break # Exit the retry loop
+
+                except (httpx.TimeoutException, httpx.ConnectError, httpx.HTTPStatusError) as e:
+                    last_exception = e
+                    print(f"⚠️ Attempt {attempt} failed: {str(e)}")
+                    
+                    # If we have tries left, wait and retry
+                    if attempt < max_retries:
+                        wait_time = 2 * attempt # Wait 2s, then 4s
+                        print(f"💤 Waiting {wait_time}s before retry...")
+                        await asyncio.sleep(wait_time)
+                    else:
+                        print("❌ All retries exhausted.")
+
+        # Check if we failed after all retries
+        if response_data is None:
+            print("❌ Final Failure: Could not send message after retries.")
+            # Re-raise the last exception caught to trigger the 500 error response
+            if isinstance(last_exception, httpx.TimeoutException):
+                raise HTTPException(status_code=504, detail="Node.js service timed out after 3 retries")
+            elif last_exception:
+                raise HTTPException(status_code=502, detail=f"Failed to send after retries: {str(last_exception)}")
+            else:
+                raise HTTPException(status_code=500, detail="Unknown error during retries")
+
+        # ============================================================
+        # 💾 DATABASE STORAGE (Only happens if loop succeeds)
+        # ============================================================
+        
+        print("💾 Storing message in Supabase...")
+        store_message(session_id, formatted_phone, text, sender, org_id)
+        update_contact_status(org_id, phone)
+        
+        return {"success": True, "data": response_data}
+
+    # 🚨 CATCH KNOWN HTTP EXCEPTIONS
+    except HTTPException as he:
+        raise he
+
+    # 🚨 CATCH EVERYTHING ELSE (Crash Report)
+    except Exception as e:
+        print("\n🛑 CRITICAL INTERNAL SERVER ERROR 🛑")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
 
 @router.get("/session/{session_id}/messages")
 async def get_messages(session_id: str, limit: int = 50):

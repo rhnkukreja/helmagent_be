@@ -549,65 +549,63 @@ def format_whatsapp_message(llm_response: str) -> str:
 # ✅ MESSAGE RECEIVED EVENT
 @router.post("/webhook/message")
 async def whatsapp_message(webhook: WhatsAppWebhook, background_tasks: BackgroundTasks):
-    """Handle incoming WhatsApp messages — ONLY act if conversation already exists"""
+    """Handle incoming WhatsApp messages"""
     session_id = webhook.session_id
     data = webhook.data
 
-    print(f"\n{'='*60}")
-    print(f"WHATSAPP WEBHOOK RECEIVED | Session: {session_id}")
-    print(f"{'='*60}")
+    print(f"\n💬 [Message] Webhook received for session: {session_id}")
+    print(f"🔹 Data: {data}")
 
-    # ── 1. Extract phone number ─────────────────────────────────────
+
     remote_jid = data.get("remoteJid", "")
     phone = None
-
+    
+    # Check if it's a LID (LinkedIn Identity Device / Channel)
     if "@lid" in remote_jid:
-        print("LID message detected → extracting phone from senderPn")
+        print("🔹 LID detected — extracting from senderPn")
+        # Extract from raw.key.senderPn
         raw_data = data.get("raw", {})
         key_data = raw_data.get("key", {})
         sender_pn = key_data.get("senderPn", "")
         
         if sender_pn and "@s.whatsapp.net" in sender_pn:
             phone = sender_pn.replace("@s.whatsapp.net", "").replace("+", "").strip()
-            print(f"Phone extracted from senderPn: {phone}")
+            print(f"✅ Phone extracted from senderPn: {phone}")
         else:
-            print("No valid senderPn found in LID → skipping")
-            return {"success": True}
-
+            print("⚠️ No valid senderPn found — phone will be null")
+            phone = None
+    
+    # Regular WhatsApp JID
     elif "@s.whatsapp.net" in remote_jid:
         phone = remote_jid.replace("@s.whatsapp.net", "").replace("+", "").strip()
-        print(f"Standard WhatsApp user → Phone: {phone}")
-
+        print(f"✅ Phone extracted from remoteJid: {phone}")
+    
+    # Group or unsupported JID
     else:
-        print(f"Unsupported JID format: {remote_jid} → ignored (group/broadcast?)")
+        print(f"⚠️ Unsupported JID format: {remote_jid} — skipping")
         return {"success": True}
 
+    # If we still don't have a phone number, skip
     if not phone:
-        print("Could not extract phone number → dropping message")
+        print("⚠️ Could not extract phone number — skipping conversation lookup")
         return {"success": True}
 
-    # ── 2. Extract message text ─────────────────────────────────────
+    # 2️⃣ Extract message content
     message_obj = data.get("message", {})
-    print(f"Raw message object: {message_obj}")
-
+    print(f"🔹 Message Object: {message_obj}")
     if isinstance(message_obj, dict):
-        message_text = message_obj.get("text", "") or message_obj.get("conversation", "")
+        message_text = message_obj.get("text", "")
     elif isinstance(message_obj, str):
         message_text = message_obj
     else:
         message_text = ""
 
-    if not message_text.strip():
-        print("Empty or media-only message → ignoring (no text to process)")
-        return {"success": True}
-
     is_from_me = data.get("fromMe", False)
     sender = "res_owner" if is_from_me else "res_customer"
-    print(f"Incoming message | From: {sender} | Text: '{message_text}'")
 
-    # ── 3. Critical Check: Does conversation exist in DB? ───────────
-    print(f"Checking if conversation exists in Supabase for phone: {phone}...")
-    
+    print(f"👤 Sender: {sender} | 💬 Message: {message_text}")
+
+    # 3️⃣ Check if conversation exists
     try:
         conv = supabase.table("conversations") \
             .select("message_list") \
@@ -616,78 +614,50 @@ async def whatsapp_message(webhook: WhatsAppWebhook, background_tasks: Backgroun
             .maybe_single() \
             .execute()
     except Exception as e:
-        print(f"Supabase query failed: {e}")
+        print(f"DB error: {e}")
         return {"success": False, "error": "DB error"}
 
-    # ── 4. Main Logic: Only proceed if conversation ALREADY exists ───
-    if not conv or conv.data:
-        print(f"NO CONVERSATION FOUND for {phone}")
-        print(f"→ Message IGNORED (no DB row = staff hasn't replied yet)")
-        print(f"→ No storage, no AI reply, no action taken.")
-        print(f"{'-'*60}")
+    # IF NO CONVERSATION EXISTS → IGNORE EVERYTHING (no store, no AI)
+    if not conv:
+        print(f"IGNORED message from {phone} → no conversation exists yet")
         return {"success": True}
 
-    print(f"CONVERSATION FOUND! Active chat with {phone} → processing message")
+    # IF CONVERSATION EXISTS → now we process normally
+    print(f"Conversation exists for {phone} → storing message & triggering AI")
 
-    # ── 5. Store incoming customer message ───────────────────────────
-    print(f"Storing customer message in DB...")
+    # Store incoming message
     store_message(session_id, int(phone), message_text, "res_customer")
-    print(f"Customer message stored successfully")
 
-    # ── 6. Update message list ───────────────────────────────────────
+    # Update message list
     message_list = conv.data.get("message_list", [])
     message_list.append({"res_customer": message_text})
-    print(f"Message list updated → now has {len(message_list)} messages")
 
-    # ── 7. Trigger AI reply in background ────────────────────────────
-    print(f"Triggering AI reply in background...")
-
+    # Trigger AI reply in background
     async def handle_ai_followup():
         try:
-            print(f"[AI] Generating reply for {phone}...")
             restaurant_name, google_review_link = "Rohan's Rest", "my-restaurant-link"
-            
             new_message = await generate_followup_message(message_list, restaurant_name, google_review_link)
             formatted = format_whatsapp_message(new_message)
-            
-            print(f"[AI] Generated reply: {formatted}")
 
-            print(f"[WHATSAPP] Sending reply to {phone} via Node.js service...")
             async with httpx.AsyncClient() as client:
-                response = await client.post(
+                await client.post(
                     f"{WHATSAPP_SERVICE_URL}/session/{session_id}/send",
                     json={"to": phone, "text": formatted},
-                    timeout=20.0
+                    timeout=15.0
                 )
-            
-            if response.status_code == 200:
-                print(f"AI reply sent successfully to {phone}")
-            else:
-                print(f"Failed to send AI reply → status: {response.status_code}")
 
-            # Store AI reply
             store_message(session_id, int(phone), formatted, "res_owner")
-            print(f"AI reply stored in DB")
-
-            # Broadcast to dashboard
             await broadcast_to_org(session_id, {
                 "type": "new_message",
                 "session_id": session_id,
                 "message": {"text": formatted, "sender": "res_owner"}
             })
-            print(f"AI reply broadcasted to dashboard")
-
         except Exception as e:
-            print(f"AI FOLLOW-UP FAILED for {phone}: {e}")
+            print(f"AI reply error: {e}")
 
     background_tasks.add_task(handle_ai_followup)
-    print(f"AI task queued successfully")
-
-    print(f"INCOMING MESSAGE FULLY PROCESSED for {phone}")
-    print(f"{'='*60}\n")
 
     return {"success": True}
-
 
 @router.post("/webhook/user-logout")
 async def whatsapp_user_logout(request: Request):

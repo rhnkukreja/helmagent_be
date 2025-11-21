@@ -6,6 +6,7 @@ import zipfile
 import tempfile
 import shutil
 import uuid
+import gc
 import traceback
 from typing import List, Dict, Any
 from datetime import datetime
@@ -255,109 +256,116 @@ async def process_bill(
             results.append({"filename": file.filename, "status": "success", "data": stored})
             continue
 
-        # ---------- ZIP ----------
+        # ---------- ZIP (NOW SAFE FOR 1000+ FILES) ----------
         if filename.endswith(".zip"):
             job_id = str(uuid.uuid4())
             temp_dir = tempfile.mkdtemp()
-            zip_path = os.path.join(temp_dir, filename)
+            zip_path = os.path.join(temp_dir, "upload.zip")
+
+            # Save ZIP safely (streaming)
             with open(zip_path, "wb") as f:
-                f.write(await file.read())
+                shutil.copyfileobj(file.file, f)
 
-            # ---- extract supported files safely ----
-            supported: List[str] = []
+            # Collect only supported files (don't extract yet
+            supported_infos = []
             with zipfile.ZipFile(zip_path, "r") as z:
-                for member in z.infolist():
-                    if member.is_dir():
+                for info in z.infolist():
+                    if info.is_dir():
                         continue
-                    name = member.filename.replace("\\", "/").lstrip("./")
-                    if name.lower().endswith((".jpg", ".jpeg", ".png", ".html")):
-                        z.extract(member, temp_dir)
-                        safe_path = os.path.normpath(os.path.join(temp_dir, name))
-                        if os.path.exists(safe_path):
-                            supported.append(name)
+                    name = info.filename.replace("\\", "/").lstrip("./")
+                    if name.lower().endswith((".jpg", ".jpeg", ".png", ".html")) and not name.startswith("__MACOSX"):
+                        supported_infos.append((info, name))
 
-            if not supported:
+            total_files = len(supported_infos)
+            if total_files == 0:
                 shutil.rmtree(temp_dir, ignore_errors=True)
                 results.append({"filename": filename, "status": "error", "error": "No supported files in ZIP"})
                 continue
 
-            # ---- split into sub-jobs ----
-            sub_jobs = []
-            completion_events = {}  # Track completion of each sub-job
-            
-            for i in range(0, len(supported), BATCH_SIZE):
-                batch = supported[i:i + BATCH_SIZE]
-                sub_id = f"{job_id}-{i // BATCH_SIZE + 1}"
-                
-                # Create an event to signal completion
-                completion_event = asyncio.Event()
-                completion_events[sub_id] = completion_event
-                
-                sub_job = {
-                    "job_id": sub_id,
-                    "parent_zip_id": job_id,
-                    "zip_path": zip_path,
-                    "temp_dir": temp_dir,
-                    "org_id": org_id,
-                    "files_list": batch,
-                    "total_files": len(batch),
-                    "processed_files": 0,
-                    "results": [],
-                    "status": "queued",
-                    "errors": [],
-                    "completion_event": completion_event,  # Add event to sub-job
-                }
-                job_status[sub_id] = sub_job
-                await processing_queue.put(sub_job)
-                sub_jobs.append(sub_id)
-
-            # parent job tracks all sub-jobs
-            job_status[job_id] = {
-                "job_id": job_id,
-                "type": "zip",
-                "temp_dir": temp_dir,
-                "sub_jobs": sub_jobs,
-                "status": "processing",
-                "total_files": len(supported),
-                "processed_files": 0,
-                "results": [],
-                "errors": [],
-            }
-
-            # ---- WAIT for all sub-jobs to complete ----
-            await asyncio.gather(*[event.wait() for event in completion_events.values()])
-
-            # ---- Collect all results ----
-            all_results = []
+            # PROCESS IN SAFE CHUNKS OF 100 FILES
+            CHUNK_SIZE = 100
+            successfully_processed = 0
             all_errors = []
-            for sub_id in sub_jobs:
-                sub_job_data = job_status[sub_id]
-                all_results.extend(sub_job_data["results"])
-                all_errors.extend(sub_job_data["errors"])
-                job_status[job_id]["processed_files"] += sub_job_data["processed_files"]
 
-            job_status[job_id]["status"] = "completed"
-            job_status[job_id]["results"] = all_results
+            print(f"[ZIP] Processing {total_files} files in chunks of {CHUNK_SIZE}...")
+
+            with zipfile.ZipFile(zip_path, "r") as z:
+                for chunk_idx, i in enumerate(range(0, total_files, CHUNK_SIZE)):
+                    chunk = supported_infos[i:i + CHUNK_SIZE]
+                    print(f"[ZIP] Processing chunk {chunk_idx + 1} — {len(chunk)} files")
+
+                    # Extract only this chunk
+                    extracted_paths = []
+                    for zip_info, name in chunk:
+                        try:
+                            path = z.extract(zip_info, temp_dir)
+                            extracted_paths.append((name, path))
+                        except Exception as e:
+                            all_errors.append(f"{name}: Extract failed — {e}")
+
+                    # Process this chunk exactly like your old code
+                    tasks = [
+                        process_one_file(name, temp_dir, org_id)
+                        for name, _ in extracted_paths
+                    ]
+                    chunk_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                    batch_to_save = []
+                    for (name, path), result in zip(extracted_paths, chunk_results):
+                        if isinstance(result, Exception):
+                            all_errors.append(f"{name}: {str(result)}")
+                            continue
+                        if result["error"]:
+                            all_errors.append(f"{name}: {result['error']}")
+                            continue
+
+                        if result["data"]:
+                            data = result["data"]
+                            data["org_id"] = org_id
+                            data["source_file"] = name
+                            data["file_type"] = result["file_type"]
+                            batch_to_save.append(data)
+                            successfully_processed += 1
+
+                        # DELETE FILE IMMEDIATELY AFTER USE
+                        try:
+                            os.remove(path)
+                        except:
+                            pass
+
+                    # Save this chunk to DB
+                    if batch_to_save:
+                        try:
+                            bulk_upsert_to_supabase(batch_to_save)
+                        except Exception as e:
+                            all_errors.append(f"DB save failed for {len(batch_to_save)} records: {e}")
+
+                    # Clean memory
+                    del chunk_results, batch_to_save, extracted_paths
+                    gc.collect()
+
+            # Final cleanup
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
             results.append({
                 "filename": filename,
                 "parent_job_id": job_id,
-                "total_files": len(supported),
-                "processed_files": job_status[job_id]["processed_files"],
-                "inserted_records": len(all_results),
+                "total_files": total_files,
+                "successfully_processed": successfully_processed,
+                "errors": all_errors or None,
                 "status": "completed",
-                "data": all_results,
-                "errors": all_errors if all_errors else None
+                "message": f"Successfully processed {successfully_processed}/{total_files} files in safe chunks"
             })
-            
-            # Cleanup temp directory
-            shutil.rmtree(temp_dir, ignore_errors=True)
             continue
 
         # ---------- UNSUPPORTED ----------
         results.append({"filename": filename, "status": "error", "error": "Unsupported file type"})
 
-    return JSONResponse(content={"status": "success", "files_processed": len(results), "details": results})
+    return JSONResponse(content={
+        "status": "success",
+        "files_processed": len(results),
+        "details": results
+    })
 
 @app.get("/queue-status/{job_id}")
 @log_memory_usage_to_file

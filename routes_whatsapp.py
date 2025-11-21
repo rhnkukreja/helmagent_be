@@ -7,12 +7,13 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException, Re
 from pydantic import BaseModel
 import httpx
 import requests
+import traceback
 from collections import defaultdict
 from dotenv import load_dotenv
 
 from supabase import create_client, Client
 from llm_responses import generate_followup_message
-from utils import update_contact_status, format_phone_number
+from utils import update_contact_status, format_phone_number, fetch_rest_detail
 # ============= CONFIG =============
 load_dotenv()
 
@@ -305,10 +306,16 @@ async def send_whatsapp(request: Request):
             raise HTTPException(status_code=400, detail="WhatsApp session is not connected")
 
         # 3. Format Phone Number
-        try:
-            formatted_phone = format_phone_number(org_id, phone)
-        except Exception as format_error:
-            raise HTTPException(status_code=400, detail=f"Invalid phone format: {str(format_error)}")
+        if phone.startswith('+91') or phone.startswith('+1'):
+            # Remove the '+' sign as requested
+            formatted_phone = phone[1:]
+            print("➡️ Phone number already has country code, formatted as:", formatted_phone)
+        else:
+            try:
+                # Add country code from org_id (assuming format_phone_number adds it)
+                formatted_phone = format_phone_number(org_id, phone)
+            except Exception as format_error:
+                raise HTTPException(status_code=400, detail=f"Invalid phone format: {str(format_error)}")
 
         print(f"🚀 Connecting to Node.js service...")
         
@@ -493,7 +500,6 @@ async def disconnect_whatsapp(session_id: str):
         "session_id": session_id
     }
 
-# ============= WEBHOOK =============
 # ============= WEBHOOK (MULTI-ENDPOINT VERSION) =============
 from fastapi import BackgroundTasks
 
@@ -562,7 +568,6 @@ async def whatsapp_connected(webhook: WhatsAppWebhook):
     })
 
     return {"success": True}
-
 
 # ✅ DISCONNECTED EVENT
 @router.post("/webhook/disconnect")
@@ -716,7 +721,10 @@ async def whatsapp_message(webhook: WhatsAppWebhook, background_tasks: Backgroun
 
             # 1️⃣ Store customer message
             print("💾 Saving customer message...")
-            restaurant_name, google_review_link = "Rohan's Rest", "my-restaurant-link"
+            print("session id:", session_id)
+            restaurant_name, google_review_link = fetch_rest_detail(session_id)
+            print("🏪 Restaurant Name:", restaurant_name)
+            print("🔗 Google Review Link:", google_review_link)
             print("🤖 Generating AI reply...")
             new_message = await generate_followup_message(message_list, restaurant_name, google_review_link)
             formatted = format_whatsapp_message(new_message)
@@ -867,3 +875,4 @@ async def health():
         "active_sessions": len(active_sessions),
         "websocket_connections": len(websocket_connections),
     }
+

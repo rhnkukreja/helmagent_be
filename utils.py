@@ -95,3 +95,33 @@ def format_phone_number(org_id: str, phone: str):
     print(f"📱 Final formatted phone: {formatted}")
 
     return formatted
+
+def fetch_rest_detail(org_id: str):
+    """
+    Fetch restaurant details like name and WhatsApp number using org_id.
+    """
+    print(f"➡️ Fetching restaurant details for org_id: {org_id}")
+
+    try:
+        rest_data = supabase.table("organizations") \
+            .select("name, google_review_link") \
+            .eq("org_id", org_id) \
+            .execute()
+
+        print("➡️ Fetched restaurant data:", rest_data.data)
+        if rest_data.data and len(rest_data.data) > 0:
+            name = rest_data.data[0].get("name", "Unknown")
+            link = rest_data.data[0].get("google_review_link", "")
+            return name,link
+        else:
+            raise Exception("No organization found with the given org_id.")
+
+    except Exception as e:
+        print(f"❌ Error fetching restaurant details: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Supabase error: {str(e)}")
+
+if __name__ == "__main__":
+    # Test the functions here if needed
+    org_id = "fc442d0b-17a5-479c-8cda-4bd0a30c0c5e"
+    fetch_rest_detail(org_id)
+    print("---")

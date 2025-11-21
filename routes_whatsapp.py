@@ -269,7 +269,10 @@ def store_message(session_id, phone, message, sender, org_id=None):
 
 @router.post("/send-whatsapp")
 async def send_whatsapp(request: Request):
-    """Send WhatsApp message with 3 Retries on Failure"""
+    """
+    Sends WhatsApp message with a retry mechanism that mimics 
+    'clicking the button again' if the first attempt fails.
+    """
     
     # 🛡️ MASTER TRY/CATCH BLOCK
     try:
@@ -282,13 +285,13 @@ async def send_whatsapp(request: Request):
         
         print(f"➡️ Preparing to send message to phone: {phone} for org_id: {org_id}")
 
-        # Validation
+        # 1. Validate Inputs
         if not org_id or not phone or not text:
             raise HTTPException(status_code=400, detail="org_id, phone, and message are required")
 
         sender = "res_owner"
         
-        # Database Lookup
+        # 2. Check Session Status
         res = supabase.table("whatsapp_sessions").select("id, status").eq("id", org_id).execute()
         
         if not res.data:
@@ -301,7 +304,7 @@ async def send_whatsapp(request: Request):
         if status != "connected":
             raise HTTPException(status_code=400, detail="WhatsApp session is not connected")
 
-        # Formatting
+        # 3. Format Phone Number
         try:
             formatted_phone = format_phone_number(org_id, phone)
         except Exception as format_error:
@@ -310,7 +313,29 @@ async def send_whatsapp(request: Request):
         print(f"🚀 Connecting to Node.js service...")
         
         # ============================================================
-        # 🔄 RETRY LOGIC STARTS HERE
+        # 🔍 HEALTH CHECK — Wake up the Node.js WhatsApp Service
+        # ============================================================
+        async with httpx.AsyncClient() as client:
+            try:
+                print("🩺 Pinging WhatsApp service /health ...")
+
+                health_res = await client.get(f"{WHATSAPP_SERVICE_URL}/health", timeout=5.0)
+
+                print(f"🩺 Health response status: {health_res.status_code}")
+                print(f"🩺 Health response body: {health_res.text}")
+
+                if health_res.status_code != 200:
+                    print("❌ WhatsApp service returned non-200 on /health")
+                    raise HTTPException(status_code=503, detail="WhatsApp service unhealthy")
+
+                print("✅ WhatsApp service is healthy — continuing to send message.")
+
+            except Exception as e:
+                print(f"❌ Health check failed: {e}")
+                raise HTTPException(status_code=503, detail="WhatsApp service is not responding")
+
+        # ============================================================
+        # 🔄 RETRY LOGIC (Simulates 'Clicking Again')
         # ============================================================
         max_retries = 3
         last_exception = None
@@ -319,7 +344,7 @@ async def send_whatsapp(request: Request):
         async with httpx.AsyncClient() as client:
             for attempt in range(1, max_retries + 1):
                 try:
-                    print(f"⏳ Attempt {attempt}/{max_retries}: Sending to Node.js...")
+                    print(f"🔹 Attempt {attempt}/{max_retries}...")
                     
                     response = await client.post(
                         f"{WHATSAPP_SERVICE_URL}/session/{session_id}/send",
@@ -327,49 +352,45 @@ async def send_whatsapp(request: Request):
                         timeout=30.0 
                     )
                     
-                    # Read response to ensure we got data
                     response_text = await response.aread()
                     
-                    # If status is 400-499 (Client Error), do NOT retry (it won't fix itself)
+                    # If we get a 4xx error (like 'Invalid Number'), retrying won't help. Stop immediately.
                     if 400 <= response.status_code < 500:
                         print(f"❌ Client Error {response.status_code}: {response_text}")
                         response.raise_for_status()
 
-                    # If status is 500+ or OK, check status
+                    # If we get a 200 OK, we are done!
                     response.raise_for_status()
 
-                    # ✅ SUCCESS!
                     print(f"✅ Success on attempt {attempt}. Node Response: {response.status_code}")
                     response_data = response.json()
-                    break # Exit the retry loop
+                    break # Exit the retry loop immediately
 
                 except (httpx.TimeoutException, httpx.ConnectError, httpx.HTTPStatusError) as e:
+                    # This block catches Timeouts, Connection Refused, or 500 Errors
                     last_exception = e
                     print(f"⚠️ Attempt {attempt} failed: {str(e)}")
                     
-                    # If we have tries left, wait and retry
                     if attempt < max_retries:
-                        wait_time = 2 * attempt # Wait 2s, then 4s
-                        print(f"💤 Waiting {wait_time}s before retry...")
-                        await asyncio.sleep(wait_time)
+                        # 👉 THIS IS THE FIX: Wait 2 seconds before the 'next req'
+                        print("⏳ Waiting 2 seconds before retrying (waking up connection)...")
+                        await asyncio.sleep(2)
                     else:
                         print("❌ All retries exhausted.")
 
-        # Check if we failed after all retries
+        # 4. Final Check
         if response_data is None:
             print("❌ Final Failure: Could not send message after retries.")
-            # Re-raise the last exception caught to trigger the 500 error response
             if isinstance(last_exception, httpx.TimeoutException):
-                raise HTTPException(status_code=504, detail="Node.js service timed out after 3 retries")
+                raise HTTPException(status_code=504, detail="Node.js service timed out (Server might be restarting)")
             elif last_exception:
-                raise HTTPException(status_code=502, detail=f"Failed to send after retries: {str(last_exception)}")
+                raise HTTPException(status_code=502, detail=f"Failed to send after {max_retries} attempts: {str(last_exception)}")
             else:
                 raise HTTPException(status_code=500, detail="Unknown error during retries")
 
         # ============================================================
         # 💾 DATABASE STORAGE (Only happens if loop succeeds)
         # ============================================================
-        
         print("💾 Storing message in Supabase...")
         store_message(session_id, formatted_phone, text, sender, org_id)
         update_contact_status(org_id, phone)
@@ -691,23 +712,64 @@ async def whatsapp_message(webhook: WhatsAppWebhook, background_tasks: Backgroun
     # Trigger AI reply in background
     async def handle_ai_followup():
         try:
+            print("🚀 Background task started")
+
+            # 1️⃣ Store customer message
+            print("💾 Saving customer message...")
             restaurant_name, google_review_link = "Rohan's Rest", "my-restaurant-link"
+            print("🤖 Generating AI reply...")
             new_message = await generate_followup_message(message_list, restaurant_name, google_review_link)
             formatted = format_whatsapp_message(new_message)
+            print("📨 AI message to be sent as the next step:", formatted)
 
+            print("📡 Sending AI reply to WhatsApp...")
+            max_retries=3
             async with httpx.AsyncClient() as client:
-                await client.post(
-                    f"{WHATSAPP_SERVICE_URL}/session/{session_id}/send",
-                    json={"to": phone, "text": formatted},
-                    timeout=15.0
-                )
+                for attempt in range(1, max_retries + 1):
+                    try:
+                        print(f"🔹 Attempt {attempt}/{max_retries}...")
+                        
+                        response=await client.post(
+                                f"{WHATSAPP_SERVICE_URL}/session/{session_id}/send",
+                                json={"to": phone, "text": formatted},
+                                timeout=15.0
+                        )
+                        response_text = await response.aread()
+                        
+                        # If we get a 4xx error (like 'Invalid Number'), retrying won't help. Stop immediately.
+                        if 400 <= response.status_code < 500:
+                            print(f"❌ Client Error {response.status_code}: {response_text}")
+                            response.raise_for_status()
 
+                        # If we get a 200 OK, we are done!
+                        response.raise_for_status()
+
+                        print(f"✅ Success on attempt {attempt}. Node Response: {response.status_code}")
+                        break # Exit the retry loop immediately
+
+                    except (httpx.TimeoutException, httpx.ConnectError, httpx.HTTPStatusError) as e:
+                        # This block catches Timeouts, Connection Refused, or 500 Errors
+                        print(f"⚠️ Attempt {attempt} failed: {str(e)}")
+                        
+                        if attempt < max_retries:
+                            # 👉 THIS IS THE FIX: Wait 2 seconds before the 'next req'
+                            print("⏳ Waiting 2 seconds before retrying (waking up connection)...")
+                            await asyncio.sleep(2)
+                        else:
+                            print("❌ All retries exhausted.")
+
+            print("💾 Saving AI reply in DB...")
+            
             store_message(session_id, int(phone), formatted, "res_owner")
+            
             await broadcast_to_org(session_id, {
                 "type": "new_message",
                 "session_id": session_id,
                 "message": {"text": formatted, "sender": "res_owner"}
             })
+
+            print("✅ Background task completed successfully")
+
         except Exception as e:
             print(f"AI reply error: {e}")
 

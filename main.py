@@ -8,8 +8,10 @@ import shutil
 import uuid
 import gc
 import traceback
+import asyncio
 from typing import List, Dict, Any
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,11 +21,9 @@ from openai import AsyncOpenAI
 from dotenv import load_dotenv
 import httpx
 import requests
-import asyncio
 
-# ---- custom modules (keep your existing implementations) ----
 from llm_responses import extract_text_from_image, extract_text_from_html
-from utils import store_in_supabase  # kept for fallback / single-record paths
+from utils import store_in_supabase
 from routes_whatsapp import router as whatsapp_router
 from routes_razorpay import router as razorpay_router
 from memory_logger import log_memory_usage_to_file
@@ -41,6 +41,7 @@ BACKEND_URL = os.getenv("BACKEND_URL")
 # ---------- CLIENTS ----------
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+thread_pool = ThreadPoolExecutor(max_workers=10)
 
 # ---------- FASTAPI ----------
 app = FastAPI(title="Bill Processor API – Async + Queue", version="2.0")
@@ -53,13 +54,14 @@ app.add_middleware(
 )
 app.include_router(whatsapp_router)
 app.include_router(razorpay_router)
+
 # ---------- QUEUE & WORKERS ----------
 processing_queue: asyncio.Queue = asyncio.Queue()
-NUM_WORKERS = int(os.getenv("NUM_WORKERS", "5"))      # tune per OpenAI tier
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "5"))        # files per GPT call
+# NUM_WORKERS = int(os.getenv("NUM_WORKERS", "5"))
+NUM_WORKERS=2
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "5"))
 RATE_LIMIT_DELAY = float(os.getenv("RATE_LIMIT_DELAY", "0.1"))
 
-# In-memory job tracker (replace with Redis for production)
 job_status: Dict[str, Dict[str, Any]] = {}
 
 
@@ -88,11 +90,13 @@ def bulk_upsert_to_supabase(extracted_data_list: List[dict]) -> List[dict]:
                     rec[field] = data.get(field)
             records.append(rec)
 
-        resp = supabase.table("bills").insert(records).execute()
-        print("Bulk upsert response completed in Supabase.")
-        return resp.data or []
+        loop = asyncio.get_event_loop()
+        resp = loop.run_in_executor(None, lambda: supabase.table("bills").insert(records).execute())
+        print("✅ Bulk upsert completed in Supabase.")
+        return [] if resp is None else getattr(resp, 'data', []) or []
     except Exception as e:
         print(f"[SUPABASE] bulk insert error: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -100,26 +104,34 @@ def bulk_upsert_to_supabase(extracted_data_list: List[dict]) -> List[dict]:
 # ---------- BACKGROUND WORKER ----------
 async def worker():
     """Consume sub-jobs from the queue and process them."""
+    print(f"[WORKER] Started")
     while True:
-        sub_job = await processing_queue.get()
-        job_id = sub_job["job_id"]
-        completion_event = sub_job.get("completion_event")
-        
-        job_status[job_id]["status"] = "running"
         try:
-            await process_sub_job(sub_job)
-            job_status[job_id]["status"] = "completed"
-        except Exception as exc:
-            job_status[job_id]["status"] = "failed"
-            job_status[job_id]["errors"].append(str(exc))
-            print(f"[WORKER] sub-job {job_id} failed: {exc}")
-        finally:
-            processing_queue.task_done()
-            # Signal completion
-            if completion_event:
-                completion_event.set()
+            sub_job = await asyncio.wait_for(processing_queue.get(), timeout=60)
+            job_id = sub_job["job_id"]
+            
+            job_status[job_id]["status"] = "running"
+            try:
+                await process_sub_job(sub_job)
+                job_status[job_id]["status"] = "completed"
+                print(f"[WORKER] Job {job_id} completed ✅")
+            except Exception as exc:
+                job_status[job_id]["status"] = "failed"
+                job_status[job_id]["errors"].append(str(exc))
+                print(f"[WORKER] Job {job_id} failed: {exc}")
+                traceback.print_exc()
+            finally:
+                processing_queue.task_done()
+        except asyncio.TimeoutError:
+            continue
+        except Exception as e:
+            print(f"[WORKER] Unexpected error: {e}")
+            traceback.print_exc()
+            await asyncio.sleep(5)
+
 
 async def process_one_file(inner_name: str, temp_dir: str, org_id: str):
+    """Process a single file (image or HTML)."""
     safe_path = os.path.normpath(os.path.join(temp_dir, inner_name.replace("\\", "/")))
 
     result = {
@@ -130,7 +142,6 @@ async def process_one_file(inner_name: str, temp_dir: str, org_id: str):
         "data": None,
     }
 
-    # File missing
     if not os.path.exists(safe_path):
         result["error"] = f"File not found: {inner_name}"
         return result
@@ -158,27 +169,22 @@ async def process_one_file(inner_name: str, temp_dir: str, org_id: str):
             result["data"] = data
             return result
 
-        # Unsupported file type
         result["error"] = f"Unsupported file type: {ext}"
         return result
 
     except Exception as e:
         result["error"] = str(e)
+        traceback.print_exc()
         return result
 
 
 async def process_sub_job(sub_job: dict):
+    """Process a batch of files from a ZIP."""
     temp_dir = sub_job["temp_dir"]
     file_list = sub_job["files_list"]
     org_id = sub_job["org_id"]
 
-    # Create parallel tasks for ALL files
-    tasks = [
-        process_one_file(inner_name, temp_dir, org_id)
-        for inner_name in file_list
-    ]
-
-    # Run all tasks concurrently
+    tasks = [process_one_file(inner_name, temp_dir, org_id) for inner_name in file_list]
     results = await asyncio.gather(*tasks)
 
     extracted_batch = []
@@ -187,7 +193,7 @@ async def process_sub_job(sub_job: dict):
         if result["error"]:
             sub_job["errors"].append(f"{result['source_file']}: {result['error']}")
             continue
-        
+
         data = result["data"]
         if not data:
             sub_job["errors"].append(f"{result['source_file']}: No data returned")
@@ -200,13 +206,12 @@ async def process_sub_job(sub_job: dict):
         extracted_batch.append(data)
         sub_job["processed_files"] += 1
 
-    # After all GPT calls completed → save results
     if extracted_batch:
-        inserted = bulk_upsert_to_supabase(extracted_batch)
-        sub_job["results"].extend(inserted)
-
-    # ---- cleanup this sub-job's temp files (parent cleans the whole dir) ----
-    # (optional per-sub-job cleanup can be added here)
+        try:
+            inserted = bulk_upsert_to_supabase(extracted_batch)
+            sub_job["results"].extend(inserted)
+        except Exception as e:
+            sub_job["errors"].append(f"DB save failed: {e}")
 
 
 # -------------------------------------------------------
@@ -217,12 +222,7 @@ async def process_bill(
     files: List[UploadFile] = File(...),
     org_id: str = Form(...),
 ):
-    """
-    Accept **any number** of images, HTMLs or ZIPs.
-    - Single files → immediate extraction.
-    - ZIP → queue sub-jobs but wait for all to complete before returning.
-    Returns results after all processing is done.
-    """
+    """Process bills from images, HTMLs, or ZIPs."""
     if not files:
         raise HTTPException(status_code=400, detail="At least one file required.")
     if not org_id:
@@ -236,168 +236,141 @@ async def process_bill(
 
         # ---------- SINGLE IMAGE ----------
         if content_type.startswith("image/") or filename.endswith((".jpg", ".jpeg", ".png")):
-            image_bytes = await file.read()
-            encoded = base64.b64encode(image_bytes).decode()
-            data = await extract_text_from_image(encoded)
-            data["file_type"] = "image"
-            data["org_id"] = org_id
-            stored = store_in_supabase(data)
-            results.append({"filename": file.filename, "status": "success", "data": stored})
+            try:
+                image_bytes = await file.read()
+                encoded = base64.b64encode(image_bytes).decode()
+                data = await extract_text_from_image(encoded)
+                data["file_type"] = "image"
+                data["org_id"] = org_id
+                stored = store_in_supabase(data)
+                results.append({"filename": file.filename, "status": "success", "data": stored})
+            except Exception as e:
+                results.append({"filename": file.filename, "status": "error", "error": str(e)})
             continue
 
         # ---------- SINGLE HTML ----------
         if filename.endswith(".html"):
-            html_bytes = await file.read()
-            html = html_bytes.decode("utf-8", errors="ignore")
-            data = await extract_text_from_html(html)
-            data["file_type"] = "html"
-            data["org_id"] = org_id
-            stored = store_in_supabase(data)
-            results.append({"filename": file.filename, "status": "success", "data": stored})
+            try:
+                html_bytes = await file.read()
+                html = html_bytes.decode("utf-8", errors="ignore")
+                data = await extract_text_from_html(html)
+                data["file_type"] = "html"
+                data["org_id"] = org_id
+                stored = store_in_supabase(data)
+                results.append({"filename": file.filename, "status": "success", "data": stored})
+            except Exception as e:
+                results.append({"filename": file.filename, "status": "error", "error": str(e)})
             continue
 
-        # ---------- ZIP (NOW SAFE FOR 1000+ FILES) ----------
+        # ---------- ZIP ----------
         if filename.endswith(".zip"):
-            job_id = str(uuid.uuid4())
-            temp_dir = tempfile.mkdtemp()
-            zip_path = os.path.join(temp_dir, "upload.zip")
+            try:
+                job_id = str(uuid.uuid4())
+                temp_dir = tempfile.mkdtemp()
+                zip_path = os.path.join(temp_dir, "upload.zip")
 
-            # Save ZIP safely (streaming)
-            with open(zip_path, "wb") as f:
-                shutil.copyfileobj(file.file, f)
+                with open(zip_path, "wb") as f:
+                    shutil.copyfileobj(file.file, f)
 
-            # Collect only supported files (don't extract yet
-            supported_infos = []
-            with zipfile.ZipFile(zip_path, "r") as z:
-                for info in z.infolist():
-                    if info.is_dir():
-                        continue
-                    name = info.filename.replace("\\", "/").lstrip("./")
-                    if name.lower().endswith((".jpg", ".jpeg", ".png", ".html")) and not name.startswith("__MACOSX"):
-                        supported_infos.append((info, name))
+                supported_infos = []
+                with zipfile.ZipFile(zip_path, "r") as z:
+                    for info in z.infolist():
+                        if info.is_dir():
+                            continue
+                        name = info.filename.replace("\\", "/").lstrip("./")
+                        if name.lower().endswith((".jpg", ".jpeg", ".png", ".html")) and not name.startswith("__MACOSX"):
+                            supported_infos.append((info, name))
 
-            total_files = len(supported_infos)
-            if total_files == 0:
+                total_files = len(supported_infos)
+                if total_files == 0:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                    results.append({"filename": filename, "status": "error", "error": "No supported files in ZIP"})
+                    continue
+
+                CHUNK_SIZE = 100
+                successfully_processed = 0
+                all_errors = []
+
+                print(f"[ZIP] Processing {total_files} files in chunks of {CHUNK_SIZE}...")
+
+                with zipfile.ZipFile(zip_path, "r") as z:
+                    for chunk_idx, i in enumerate(range(0, total_files, CHUNK_SIZE)):
+                        chunk = supported_infos[i:i + CHUNK_SIZE]
+                        print(f"[ZIP] Chunk {chunk_idx + 1} — {len(chunk)} files")
+
+                        extracted_paths = []
+                        for zip_info, name in chunk:
+                            try:
+                                path = z.extract(zip_info, temp_dir)
+                                extracted_paths.append((name, path))
+                            except Exception as e:
+                                all_errors.append(f"{name}: Extract failed — {e}")
+
+                        tasks = [process_one_file(name, temp_dir, org_id) for name, _ in extracted_paths]
+                        chunk_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                        batch_to_save = []
+                        for (name, path), result in zip(extracted_paths, chunk_results):
+                            if isinstance(result, Exception):
+                                all_errors.append(f"{name}: {str(result)}")
+                                continue
+                            if result["error"]:
+                                all_errors.append(f"{name}: {result['error']}")
+                                continue
+
+                            if result["data"]:
+                                data = result["data"]
+                                data["org_id"] = org_id
+                                data["source_file"] = name
+                                data["file_type"] = result["file_type"]
+                                batch_to_save.append(data)
+                                successfully_processed += 1
+
+                            try:
+                                os.remove(path)
+                            except:
+                                pass
+
+                        if batch_to_save:
+                            try:
+                                bulk_upsert_to_supabase(batch_to_save)
+                            except Exception as e:
+                                all_errors.append(f"DB save failed: {e}")
+
+                        del chunk_results, batch_to_save, extracted_paths
+                        gc.collect()
+
                 shutil.rmtree(temp_dir, ignore_errors=True)
-                results.append({"filename": filename, "status": "error", "error": "No supported files in ZIP"})
-                continue
 
-            # PROCESS IN SAFE CHUNKS OF 100 FILES
-            CHUNK_SIZE = 100
-            successfully_processed = 0
-            all_errors = []
-
-            print(f"[ZIP] Processing {total_files} files in chunks of {CHUNK_SIZE}...")
-
-            with zipfile.ZipFile(zip_path, "r") as z:
-                for chunk_idx, i in enumerate(range(0, total_files, CHUNK_SIZE)):
-                    chunk = supported_infos[i:i + CHUNK_SIZE]
-                    print(f"[ZIP] Processing chunk {chunk_idx + 1} — {len(chunk)} files")
-
-                    # Extract only this chunk
-                    extracted_paths = []
-                    for zip_info, name in chunk:
-                        try:
-                            path = z.extract(zip_info, temp_dir)
-                            extracted_paths.append((name, path))
-                        except Exception as e:
-                            all_errors.append(f"{name}: Extract failed — {e}")
-
-                    # Process this chunk exactly like your old code
-                    tasks = [
-                        process_one_file(name, temp_dir, org_id)
-                        for name, _ in extracted_paths
-                    ]
-                    chunk_results = await asyncio.gather(*tasks, return_exceptions=True)
-
-                    batch_to_save = []
-                    for (name, path), result in zip(extracted_paths, chunk_results):
-                        if isinstance(result, Exception):
-                            all_errors.append(f"{name}: {str(result)}")
-                            continue
-                        if result["error"]:
-                            all_errors.append(f"{name}: {result['error']}")
-                            continue
-
-                        if result["data"]:
-                            data = result["data"]
-                            data["org_id"] = org_id
-                            data["source_file"] = name
-                            data["file_type"] = result["file_type"]
-                            batch_to_save.append(data)
-                            successfully_processed += 1
-
-                        # DELETE FILE IMMEDIATELY AFTER USE
-                        try:
-                            os.remove(path)
-                        except:
-                            pass
-
-                    # Save this chunk to DB
-                    if batch_to_save:
-                        try:
-                            bulk_upsert_to_supabase(batch_to_save)
-                        except Exception as e:
-                            all_errors.append(f"DB save failed for {len(batch_to_save)} records: {e}")
-
-                    # Clean memory
-                    del chunk_results, batch_to_save, extracted_paths
-                    gc.collect()
-
-            # Final cleanup
-            shutil.rmtree(temp_dir, ignore_errors=True)
-
-            results.append({
-                "filename": filename,
-                "parent_job_id": job_id,
-                "total_files": total_files,
-                "successfully_processed": successfully_processed,
-                "errors": all_errors or None,
-                "status": "completed",
-                "message": f"Successfully processed {successfully_processed}/{total_files} files in safe chunks"
-            })
+                results.append({
+                    "filename": filename,
+                    "parent_job_id": job_id,
+                    "total_files": total_files,
+                    "successfully_processed": successfully_processed,
+                    "errors": all_errors or None,
+                    "status": "completed",
+                })
+            except Exception as e:
+                print(f"[ZIP] Error: {e}")
+                traceback.print_exc()
+                results.append({"filename": filename, "status": "error", "error": str(e)})
             continue
 
-        # ---------- UNSUPPORTED ----------
         results.append({"filename": filename, "status": "error", "error": "Unsupported file type"})
 
-    return JSONResponse(content={
-        "status": "success",
-        "files_processed": len(results),
-        "details": results
-    })
+    return JSONResponse(content={"status": "success", "files_processed": len(results), "details": results})
+
 
 @app.get("/queue-status/{job_id}")
 @log_memory_usage_to_file
 async def get_queue_status(job_id: str):
-    """Poll any job (parent ZIP or sub-job)."""
+    """Poll job status."""
     if job_id not in job_status:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
 
     info = job_status[job_id].copy()
-    # hide heavy fields from response
     for k in ["zip_path", "temp_dir", "files_list"]:
         info.pop(k, None)
-
-    # if it's a parent ZIP, aggregate sub-job stats
-    if info.get("type") == "zip":
-        sub_stats = []
-        processed = 0
-        total = 0
-        for sub_id in info.get("sub_jobs", []):
-            sub = job_status.get(sub_id, {})
-            sub_stats.append({
-                "sub_job_id": sub_id,
-                "status": sub.get("status", "unknown"),
-                "processed": sub.get("processed_files", 0),
-                "total": sub.get("total_files", 0),
-                "errors": sub.get("errors", []),
-            })
-            processed += sub.get("processed_files", 0)
-            total += sub.get("total_files", 0)
-        info["sub_job_details"] = sub_stats
-        info["processed_files"] = processed
-        info["total_files"] = total
 
     return info
 
@@ -405,30 +378,17 @@ async def get_queue_status(job_id: str):
 @app.get("/dashboard/{org_id}")
 @log_memory_usage_to_file
 async def get_dashboard_data(org_id: str):
+    """Fetch dashboard data from Supabase."""
     try:
-        print("Fetching organization for org_id:", org_id)
-        print("Supabase org_id type:", type(org_id), "value:", org_id)
-
-        # --- fetch safely ---
-        query = (
-            supabase.table("organizations")
-            .select("*")
-            .eq("org_id", str(org_id))  # Supabase client should handle UUID conversion
+        loop = asyncio.get_event_loop()
+        org_response = await loop.run_in_executor(
+            None,
+            lambda: supabase.table("organizations").select("*").eq("org_id", str(org_id)).execute()
         )
 
-        # Use `.execute()` and check if data is empty
-        try:
-            org_response = query.execute()
-            print("Query response:", org_response.data)  # Debug line
-            # Check if we actually got data
-            org = org_response.data[0] if org_response.data else None
-        except Exception as inner_e:
-            print("Query failed:", inner_e)
-            org = None
+        org = org_response.data[0] if org_response.data else None
 
         if not org:
-            print("⚠️ No organization found in Supabase for org_id:", org_id)
-            # return dummy default if nothing found
             org = {
                 "name": "Unnamed Restaurant",
                 "owner_name": "Owner Not Set",
@@ -439,17 +399,11 @@ async def get_dashboard_data(org_id: str):
                 "avg_rating": 0.0,
             }
 
-        # --- Fetch activities (safe) ---
-        activities_response = (
-            supabase.table("activities")
-            .select("*")
-            .eq("org_id", org_id)
-            .order("created_at", desc=True)
-            .limit(10)
-            .execute()
+        activities_response = await loop.run_in_executor(
+            None,
+            lambda: supabase.table("activities").select("*").eq("org_id", org_id).order("created_at", desc=True).limit(10).execute()
         )
-        activities = getattr(activities_response, "data", []) or []
-        print("Fetched activities:", activities)
+        activities = activities_response.data or []
 
         dashboard_data = {
             "organization": {
@@ -459,23 +413,10 @@ async def get_dashboard_data(org_id: str):
                 "avg_rating": float(org.get("avg_rating", 0.0)) if org.get("avg_rating") else 0.0,
             },
             "todayStats": {
-                "reviews": {
-                    "count": org.get("total_reviews", 0),
-                    "change": "+0 today",
-                    "positive": True,
-                },
-                "conversations": {
-                    "count": org.get("active_conversations", 0),
-                    "activeNow": 0,
-                },
-                "issues": {
-                    "count": org.get("open_issues", 0),
-                    "label": "open issues",
-                },
-                "rating": {
-                    "value": float(org.get("avg_rating", 0.0)) if org.get("avg_rating") else 0.0,
-                    "change": "No change",
-                },
+                "reviews": {"count": org.get("total_reviews", 0), "change": "+0 today", "positive": True},
+                "conversations": {"count": org.get("active_conversations", 0), "activeNow": 0},
+                "issues": {"count": org.get("open_issues", 0), "label": "open issues"},
+                "rating": {"value": float(org.get("avg_rating", 0.0)) if org.get("avg_rating") else 0.0, "change": "No change"},
             },
             "activities": activities,
         }
@@ -483,93 +424,75 @@ async def get_dashboard_data(org_id: str):
         return {"success": True, "data": dashboard_data}
 
     except Exception as e:
-        import traceback
-        print("Error in dashboard:", traceback.format_exc())
+        print(f"❌ Dashboard error: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
-
 
 
 @app.get("/bills/{org_id}")
 @log_memory_usage_to_file
 async def get_bills(org_id: str):
-    """
-    Fetch customer bills from Supabase for a specific organization.
-    Includes formatted order date and all bill details.
-    """
+    """Fetch bills from Supabase."""
     try:
-        print(f"Fetching bills for org_id: {org_id}")
-        response = (
-            supabase.table("bills")
-            .select("*")
-            .eq("org_id", org_id)
-            .order("id", desc=True)
-            .execute()
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: supabase.table("bills").select("*").eq("org_id", org_id).order("id", desc=True).execute()
         )
 
         bills = response.data or []
-        print(f"Fetched {len(bills)} bills for org_id={org_id}")
 
-        # 🧩 Add readable date and total formatting
         for bill in bills:
-            # Handle bill_date (format for frontend)
             bill_date = bill.get("bill_date")
             if bill_date:
                 try:
-                    # Convert to "Oct 28, 2025" format
                     formatted = datetime.strptime(bill_date, "%Y-%m-%d").strftime("%b %d, %Y")
                     bill["order_date"] = formatted
                 except Exception:
-                    bill["order_date"] = bill_date  # fallback to raw
+                    bill["order_date"] = bill_date
             else:
                 bill["order_date"] = "—"
 
-            # Ensure total_amount is numeric (avoid None)
             bill["total_amount"] = str(bill.get("total_amount") or "")
 
         return {"success": True, "data": bills}
 
     except Exception as e:
-        print("Error fetching bills:", str(e))
+        print(f"❌ Error fetching bills: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-
-from fastapi import Request
-import traceback
-import json
 
 @app.get("/whatsapp/status/{org_id}")
 @log_memory_usage_to_file
 async def get_whatsapp_status(org_id: str):
-    res = supabase.table("whatsapp_connections").select("*").eq("org_id", org_id).execute()
-    
-    if not res.data:
-        return {"status": "not_connected"}
-    return res.data[0]
-
+    """Fetch WhatsApp connection status."""
+    try:
+        loop = asyncio.get_event_loop()
+        res = await loop.run_in_executor(
+            None,
+            lambda: supabase.table("whatsapp_connections").select("*").eq("org_id", org_id).execute()
+        )
+        if not res.data:
+            return {"status": "not_connected"}
+        return res.data[0]
+    except Exception as e:
+        print(f"❌ Error fetching WhatsApp status: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 from pydantic import BaseModel
-from datetime import datetime
+
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
-# Initialize OpenAI client
+
 
 def get_restaurant_name(uuid: str) -> str:
-    """
-    Fetches the user's display name from Supabase Auth using UUID.
-    Reads from user_metadata['display_name'] (or falls back to full_name / restaurant_name / email).
-    """
+    """Fetch restaurant name from Supabase Auth."""
     try:
         url = f"{SUPABASE_URL}/auth/v1/admin/users/{uuid}"
-        headers = {
-            "apikey": SUPABASE_SERVICE_KEY,
-            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-        }
-
-        res = requests.get(url, headers=headers)
+        headers = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
+        res = requests.get(url, headers=headers, timeout=5)
         res.raise_for_status()
         user = res.json()
-
-        # Extract from nested user_metadata
         metadata = user.get("user_metadata", {})
         display_name = (
             metadata.get("display_name")
@@ -577,15 +500,14 @@ def get_restaurant_name(uuid: str) -> str:
             or metadata.get("full_name")
             or user.get("email")
         )
-
         return display_name.strip() if display_name else "Unknown"
-    
     except Exception as e:
-        print(f"❌ Error fetching display_name for {uuid}: {e}")
+        print(f"❌ Error fetching restaurant name: {e}")
         return "Unknown"
 
+
 class GenerateMessageRequest(BaseModel):
-    org_id: str  
+    org_id: str
     name: str
     phone: str
     items_ordered: str
@@ -596,162 +518,68 @@ class GenerateMessageRequest(BaseModel):
 @app.post("/generate-message")
 @log_memory_usage_to_file
 async def generate_message(request: GenerateMessageRequest):
-    """
-    Generate personalized WhatsApp message using AI based on customer order data
-    """
+    """Generate personalized WhatsApp message using AI."""
     try:
         print("\n" + "="*60)
         print("🤖 GENERATING AI MESSAGE")
         print("="*60)
-        print(f"Organization ID: {request.org_id}")
-        print(f"Customer: {request.name}")
-        print(f"Phone: {request.phone}")
-        print(f"Items: {request.items_ordered}")
-        print(f"Date: {request.order_date}")
-        print(f"Amount: {request.total_amount}")
         rest_name = get_restaurant_name(request.org_id)
 
         prompt = f"""
-            You are a restaurant manager writing a personalized WhatsApp message to a customer after their visit.
-            Restaurant Details:
-            - Name: {rest_name}
-            Customer Details:
-            - Name: {request.name}
-            - Order Date: {request.order_date}
-            - Items Ordered: {request.items_ordered}
-            - Total Amount: ₹{request.total_amount}
+You are a restaurant manager writing a personalized WhatsApp message to a customer after their visit.
+Restaurant: {rest_name}
+Customer: {request.name}
+Order Date: {request.order_date}
+Items: {request.items_ordered}
+Amount: ₹{request.total_amount}
 
-            Goal:
-            Generate a warm, professional, and friendly WhatsApp message asking for customer feedback.
+Generate a warm, friendly message asking for feedback (under 150 words). Include:
+1. Greeting addressing customer appropriately
+2. Thank them for visiting
+3. Mention 1-2 dishes they ordered
+4. Polite feedback request
+5. End with: "Warm regards,\\n[Restaurant Name] Team ❤️"
 
-            Guidelines:
-            1. Address the customer as:
-            - "{request.name} Sir" if the name sounds male
-            - "{request.name} Ma’am" if the name sounds female
-            - "Dear Guest" if gender is uncertain
-            (Always include greeting like “Hello” or “Dear”)
-            2. Use a conversational yet polished tone with 1–2 emojis — not overly casual, not overly formal.
-            3. Thank them sincerely for visiting and mention their order date naturally.
-            4. Highlight 1–2 dishes they ordered and include a short chef-inspired detail 
-            (e.g., “Our Butter Chicken is made with hand-ground spices for that authentic flavor.”)
-            5. Politely ask how their experience was and encourage them to share feedback.
-            6. Keep the message concise (under 150 words).
-            7. End with this exact closing format:
+Output ONLY the message text.
+"""
 
-            Warm regards,  
-            [Restaurant Name] Team ❤️
-
-            8. Never mention ‘Beef’.
-            9. Output only the WhatsApp message text — no explanations, no labels.
-
-            """
-
-
-        # Call OpenAI API
         response = await client.chat.completions.create(
-            model="gpt-4o-mini",  # or gpt-4o for better quality
+            model="gpt-4o-mini",
             messages=[
-                {
-                    "role": "system",
-                    "content": "You are a friendly restaurant manager writing personalized WhatsApp messages to customers. Be warm, genuine, and encourage honest feedback."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
+                {"role": "system", "content": "You are a friendly restaurant manager."},
+                {"role": "user", "content": prompt}
             ],
             temperature=0.7,
             max_tokens=300
         )
 
         ai_message = response.choices[0].message.content.strip()
-        
-        print(f"\n✅ AI Message Generated:")
-        print(ai_message)
-        print("="*60 + "\n")
-        
-        return {
-            "success": True,
-            "message": ai_message,
-            "customer": {
-                "name": request.name,
-                "phone": request.phone
-            }
-        }
-        
+        print(f"✅ Message generated\n{ai_message}\n" + "="*60)
+
+        return {"success": True, "message": ai_message, "customer": {"name": request.name, "phone": request.phone}}
+
     except Exception as e:
-        print(f"\n❌ Error generating message: {str(e)}")
-        return JSONResponse(
-            content={
-                "success": False,
-                "error": f"Failed to generate message: {str(e)}"
-            },
-            status_code=500
-        )
+        print(f"❌ Error: {e}")
+        traceback.print_exc()
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
 
-async def generate_response(chat_history: List[Dict[str, Any]]) -> str:
-    """
-    Send chat history to backend LLM to generate a new response.
-    Assumes backend endpoint /generate-response expects {"messages": [{"role": str, "content": str}, ...]}
-    with oldest message first.
-    """
-    # Prepare messages for LLM: reverse to chronological order (oldest first), map to roles
-    messages_reversed = chat_history[::-1]  # Reverse: oldest first
-    llm_messages = []
-    for msg in messages_reversed:
-        role = "assistant" if msg.get("is_sender", False) else "user"
-        content = msg.get("text", "")
-        if content:  # Skip empty
-            llm_messages.append({"role": role, "content": content})
-
-    print(f"\n🤖 Generating response based on {len(llm_messages)} messages...")
-    print(f"Last few for context: {json.dumps(llm_messages[-3:], indent=2)}")  # Log last 3
-
-    payload = {"messages": llm_messages}
-
-    try:
-            generated_msg="Sample generated response."
-            return generated_msg
-        # else:
-        #     print(f"❌ LLM generation error: {response.status_code} - {response.text}")
-        #     raise Exception(f"Failed to generate response: {response.status_code}")
-            
-    except Exception as e:
-        print(f"❌ Exception generating response: {str(e)}")
-        # Fallback message
-        return "Thanks for your message! How can I assist you today?"
-
-from fastapi import FastAPI, Request
-from typing import Any, Dict
 
 @app.get("/conversations/{org_id}")
 @log_memory_usage_to_file
 async def get_conversations(org_id: str):
-    """
-    Step 1: Fetch account_id from whatsapp_connections using org_id.
-    Step 2: Fetch conversations using account_id.
-    Step 3: Clean data and return JSON-stringified message_list.
-    """
+    """Fetch conversations."""
     try:
-        # Step 1 — get account_id
-
-        session_id = org_id
-        # Step 2 — fetch conversations
-        response = (
-            supabase.table("conversations")
-            .select("*")
-            .eq("session_id", session_id)
-            .order("created_at", desc=True)
-            .execute()
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: supabase.table("conversations").select("*").eq("session_id", org_id).order("created_at", desc=True).execute()
         )
 
         if not response.data:
             return {"success": True, "data": []}
 
-        # Step 3 — clean data
         conversations = []
         for row in response.data:
-            # Ensure message_list is serialized properly
             message_list = row.get("message_list", [])
             if not isinstance(message_list, str):
                 try:
@@ -761,7 +589,7 @@ async def get_conversations(org_id: str):
 
             conversations.append({
                 "id": row.get("id"),
-                "name": row.get("name") or None,
+                "name": row.get("name"),
                 "phone": row.get("phone"),
                 "order_date": row.get("order_date"),
                 "message_list": message_list,
@@ -770,14 +598,12 @@ async def get_conversations(org_id: str):
                 "session_id": row.get("session_id"),
             })
 
-        print("✅ Conversations prepared:", len(conversations))
-        print(conversations)
         return {"success": True, "data": conversations}
 
-    except HTTPException:
-        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching conversations: {str(e)}")
+        print(f"❌ Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 class GoogleReviewLinkRequest(BaseModel):
     org_id: str
@@ -787,114 +613,91 @@ class GoogleReviewLinkRequest(BaseModel):
 @app.post("/settings/save-google-review")
 @log_memory_usage_to_file
 async def save_google_review_link(request: GoogleReviewLinkRequest):
-    """
-    Save or update the Google Review link for the organization
-    """
+    """Save Google Review link."""
     try:
         org_id = str(request.org_id).strip()
         review_link = request.link.strip()
-        
+
         if not org_id or not review_link:
             raise HTTPException(status_code=400, detail="Missing org_id or link")
-        
-        # ✅ Check if organization exists
-        existing = supabase.table("organizations")\
-            .select("*")\
-            .eq("org_id", org_id)\
-            .execute()
-        
-        print(f"Query result: {existing.data}")
-        
-        if not existing.data or len(existing.data) == 0:
-            raise HTTPException(
-                status_code=404, 
-                detail=f"Organization not found with org_id: {org_id}"
-            )
-        
-        # ✅ Update the review link (NOT upsert, since org already exists)
-        response = supabase.table("organizations")\
-            .update({"google_review_link": review_link})\
-            .eq("org_id", org_id)\
-            .execute()
-        
+
+        loop = asyncio.get_event_loop()
+        existing = await loop.run_in_executor(
+            None,
+            lambda: supabase.table("organizations").select("*").eq("org_id", org_id).execute()
+        )
+
+        if not existing.data:
+            raise HTTPException(status_code=404, detail=f"Organization not found")
+
+        response = await loop.run_in_executor(
+            None,
+            lambda: supabase.table("organizations").update({"google_review_link": review_link}).eq("org_id", org_id).execute()
+        )
+
         if not response.data:
-            raise HTTPException(
-                status_code=500, 
-                detail="Failed to save Google Review link"
-            )
-        
-        return {
-            "message": "Google Review link saved successfully!", 
-            "data": response.data[0]
-        }
-        
+            raise HTTPException(status_code=500, detail="Failed to save link")
+
+        return {"message": "Google Review link saved successfully!", "data": response.data[0]}
+
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Error saving review link: {e}")
+        print(f"❌ Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/settings/google-review/{org_id}")
 @log_memory_usage_to_file
 async def get_google_review_link(org_id: str):
-    """
-    Fetch the saved Google Review link for an organization.
-    Returns a message if the link is None or empty instead of 404 error.
-    """
+    """Fetch Google Review link."""
     try:
-        response = supabase.table("organizations") \
-            .select("google_review_link") \
-            .eq("org_id", org_id) \
-            .execute()
-        
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: supabase.table("organizations").select("google_review_link").eq("org_id", org_id).execute()
+        )
+
         if not response.data:
             return {"message": "Organization not found", "link": None}
-        
+
         review_link = response.data[0].get("google_review_link")
-        
         if not review_link:
             return {"message": "No review link found", "link": None}
-        
+
         return {"link": review_link}
-    
+
     except Exception as e:
-        print("❌ Error fetching review link:", e)
+        print(f"❌ Error: {e}")
         return {"message": "Internal server error", "error": str(e)}
 
 
 # ---------- START WORKERS ----------
 @app.on_event("startup")
 async def startup_event():
-    print(f"Starting {NUM_WORKERS} background workers...")
-    for _ in range(NUM_WORKERS):
-        asyncio.create_task(worker())
-
-    # optional: clean old temp dirs on startup
-    # (omitted for brevity)
+    print(f"🚀 Starting {NUM_WORKERS} background workers...")
+    for i in range(NUM_WORKERS):
+        task = asyncio.create_task(worker())
+        print(f"✅ Worker {i+1} created")
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    print("⏹️  Shutting down...")
     await processing_queue.join()
-    # clean any remaining temp dirs
-    for job in list(job_status.values()):
-        if "temp_dir" in job:
-            shutil.rmtree(job["temp_dir"], ignore_errors=True)
 
 
-# -------------------------------------------------------
 # ---------- ROOT ----------
 @app.get("/")
 async def root():
-    return {"message": "Enhanced Async Bill OCR API Running"}
+    return {"message": "RepAgent Bill Processor API Running ✅"}
+
 
 @app.head("/")
 def head_root():
     return {"status": "ok"}
 
 
-# -------------------------------------------------------
-# ---------- RUN ----------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)

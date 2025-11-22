@@ -17,13 +17,13 @@ client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 # ============================================================
 async def extract_text_from_image(image_base64: str) -> dict:
     """
-    Uses GPT-4 Vision to extract structured data (name, contact_number, items_ordered, date, total_amount)
+    Uses GPT-5 Vision to extract structured data (name, contact_number, items_ordered, date, total_amount)
     from an image of a bill or invoice.
     Returns dict with keys: name, contact_number, items_ordered (list), date (YYYY-MM-DD), total_amount (float).
     """
     try:
         response = await client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5-nano",
             messages=[
                 {
                     "role": "system",
@@ -60,7 +60,7 @@ async def extract_text_from_image(image_base64: str) -> dict:
                     ],
                 },
             ],
-            temperature=0.1,
+            temperature=1,
         )
 
         raw_output = response.choices[0].message.content.strip()
@@ -83,14 +83,14 @@ async def extract_text_from_image(image_base64: str) -> dict:
 # ============================================================
 async def extract_text_from_html(html_content: str) -> dict:
     """
-    Uses GPT-4 to extract structured data (name, contact_number, items_ordered, date, total_amount)
+    Uses GPT-5 to extract structured data (name, contact_number, items_ordered, date, total_amount)
     from an uploaded HTML bill file.
     """
     try:
-        print("Processing HTML with GPT-4...")
+        print("Processing HTML with GPT-5...")
 
         response = await client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5-nano",
             messages=[
                 {
                     "role": "system",
@@ -127,7 +127,7 @@ async def extract_text_from_html(html_content: str) -> dict:
                     ],
                 },
             ],
-            temperature=0.1,
+            temperature=1,
         )
 
         raw_output = response.choices[0].message.content.strip()

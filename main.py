@@ -217,7 +217,7 @@ async def process_sub_job(sub_job: dict):
 # -------------------------------------------------------
 # ---------- ENDPOINTS ----------
 @app.post("/process-bill/")
-@log_memory_usage_to_file
+
 async def process_bill(
     files: List[UploadFile] = File(...),
     org_id: str = Form(...),
@@ -362,7 +362,7 @@ async def process_bill(
 
 
 @app.get("/queue-status/{job_id}")
-@log_memory_usage_to_file
+
 async def get_queue_status(job_id: str):
     """Poll job status."""
     if job_id not in job_status:
@@ -376,7 +376,7 @@ async def get_queue_status(job_id: str):
 
 
 @app.get("/dashboard/{org_id}")
-@log_memory_usage_to_file
+
 async def get_dashboard_data(org_id: str):
     """Fetch dashboard data from Supabase."""
     try:
@@ -430,7 +430,7 @@ async def get_dashboard_data(org_id: str):
 
 
 @app.get("/bills/{org_id}")
-@log_memory_usage_to_file
+
 async def get_bills(org_id: str):
     """Fetch bills from Supabase."""
     try:
@@ -463,7 +463,7 @@ async def get_bills(org_id: str):
 
 
 @app.get("/whatsapp/status/{org_id}")
-@log_memory_usage_to_file
+
 async def get_whatsapp_status(org_id: str):
     """Fetch WhatsApp connection status."""
     try:
@@ -516,7 +516,7 @@ class GenerateMessageRequest(BaseModel):
 
 
 @app.post("/generate-message")
-@log_memory_usage_to_file
+
 async def generate_message(request: GenerateMessageRequest):
     """Generate personalized WhatsApp message using AI."""
     try:
@@ -526,22 +526,42 @@ async def generate_message(request: GenerateMessageRequest):
         rest_name = get_restaurant_name(request.org_id)
 
         prompt = f"""
-You are a restaurant manager writing a personalized WhatsApp message to a customer after their visit.
-Restaurant: {rest_name}
-Customer: {request.name}
-Order Date: {request.order_date}
-Items: {request.items_ordered}
-Amount: ₹{request.total_amount}
+            You are a restaurant manager writing a personalized WhatsApp message to a customer after their visit.
+            Restaurant Details:
+            
+            Name: {rest_name}
+                    Customer Details:
+            Name: {request.name}
+            Order Date: {request.order_date}
+            Items Ordered: {request.items_ordered}
+            Total Amount: ₹{request.total_amount}
 
-Generate a warm, friendly message asking for feedback (under 150 words). Include:
-1. Greeting addressing customer appropriately
-2. Thank them for visiting
-3. Mention 1-2 dishes they ordered
-4. Polite feedback request
-5. End with: "Warm regards,\\n[Restaurant Name] Team ❤️"
+                        Goal:
+                        Generate a warm, professional, and friendly WhatsApp message asking for customer feedback.
 
-Output ONLY the message text.
-"""
+                        Guidelines:
+                        
+            Address the customer as:
+            "{request.name} Sir" if the name sounds male
+            "{request.name} Ma’am" if the name sounds female
+            "Dear Guest" if gender is uncertain(Always include greeting like “Hello” or “Dear”)
+            Use a conversational yet polished tone with 1–2 emojis — not overly casual, not overly formal.
+            Thank them sincerely for visiting and mention their order date naturally.
+            Highlight 1–2 dishes they ordered and include a short chef-inspired detail
+            (e.g., “Our Butter Chicken is made with hand-ground spices for that authentic flavor.”)
+            Politely ask how their experience was and encourage them to share feedback.
+            Keep the message concise (under 150 words).
+            End with this exact closing format:
+
+                        Warm regards,
+                        [Restaurant Name] Team ❤️
+
+
+                        
+            Never mention ‘Beef’.
+            Output only the WhatsApp message text — no explanations, no labels.
+
+                        """
 
         response = await client.chat.completions.create(
             model="gpt-4o-mini",
@@ -565,7 +585,7 @@ Output ONLY the message text.
 
 
 @app.get("/conversations/{org_id}")
-@log_memory_usage_to_file
+
 async def get_conversations(org_id: str):
     """Fetch conversations."""
     try:
@@ -611,7 +631,7 @@ class GoogleReviewLinkRequest(BaseModel):
 
 
 @app.post("/settings/save-google-review")
-@log_memory_usage_to_file
+
 async def save_google_review_link(request: GoogleReviewLinkRequest):
     """Save Google Review link."""
     try:
@@ -648,7 +668,7 @@ async def save_google_review_link(request: GoogleReviewLinkRequest):
 
 
 @app.get("/settings/google-review/{org_id}")
-@log_memory_usage_to_file
+
 async def get_google_review_link(org_id: str):
     """Fetch Google Review link."""
     try:

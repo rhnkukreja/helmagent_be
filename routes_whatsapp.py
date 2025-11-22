@@ -106,8 +106,7 @@ def save_session_to_db(session_id: str, org_id: str, status: str, phone: str = N
 def store_message_sync(session_id: str, phone: str, message: str, sender: str, org_id: str = None):
     """Synchronous message storage (run in thread pool)"""
     try:
-        phone_normalized = normalize_phone(phone)
-        logger.info(f"Storing message for {phone_normalized} (Session: {session_id})")
+        logger.info(f"Storing message for {phone} (Session: {session_id})")
 
         new_message = {sender: message}
 
@@ -115,7 +114,7 @@ def store_message_sync(session_id: str, phone: str, message: str, sender: str, o
             supabase.table("conversations")
             .select("message_list")
             .eq("session_id", session_id)
-            .eq("phone", phone_normalized)
+            .eq("phone", phone)
             .execute()
         )
 
@@ -124,14 +123,14 @@ def store_message_sync(session_id: str, phone: str, message: str, sender: str, o
             conversation.append(new_message)
             upsert_data = {
                 "session_id": session_id,
-                "phone": phone_normalized,
+                "phone": phone,
                 "message_list": conversation,
             }
         else:
             conversation = [new_message]
             upsert_data = {
                 "session_id": session_id,
-                "phone": phone_normalized,
+                "phone": phone,
                 "message_list": conversation,
                 "name": None,
                 "bill_amount": None,
@@ -140,7 +139,7 @@ def store_message_sync(session_id: str, phone: str, message: str, sender: str, o
 
             if org_id:
                 logger.info(f"Fetching customer details for org_id={org_id}")
-                customer_details = fetch_customer_details(org_id, phone_normalized)
+                customer_details = fetch_customer_details(org_id, phone)
                 if customer_details:
                     upsert_data.update({
                         "name": customer_details.get("name"),
@@ -155,7 +154,7 @@ def store_message_sync(session_id: str, phone: str, message: str, sender: str, o
             .execute()
         )
 
-        logger.info(f"Message stored successfully for {phone_normalized}")
+        logger.info(f"Message stored successfully for {phone}")
         return res.data
 
     except Exception as e:
@@ -170,14 +169,14 @@ async def store_message_async(session_id: str, phone: str, message: str, sender:
 def fetch_customer_details(org_id: str, phone: str):
     """Fetch customer details from bills table"""
     try:
-        phone_normalized = normalize_phone(phone)
-        logger.info(f"Fetching customer details for phone: {phone_normalized}, org_id: {org_id}")
-
+        
+        logger.info(f"Fetching customer details for phone: {phone}, org_id: {org_id}")
+        
         res = (
             supabase.table("bills")
             .select("name, bill_date, total_amount")
             .eq("org_id", org_id)
-            .eq("contact_number", phone_normalized)
+            .eq("contact_number", phone)
             .order("bill_date", desc=True)
             .limit(1)
             .execute()
@@ -196,7 +195,7 @@ def fetch_customer_details(org_id: str, phone: str):
                 "bill_amount": str(bill_amount) if bill_amount else None,
             }
 
-        logger.warning(f"No bill found for {phone_normalized}")
+        logger.warning(f"No bill found for {phone} in org {org_id}")
         return None
 
     except Exception as e:
@@ -208,22 +207,41 @@ async def send_to_whatsapp(session_id: str, phone: str, text: str, max_retries: 
     Reusable send logic with retries.
     Returns response dict or raises HTTPException
     """
-    phone_normalized = normalize_phone(phone)
+    if phone.startswith('+91') or phone.startswith('+1'):   # change needed here to check for 91 numbers without the +
+        # Remove the '+' sign as requested
+        formatted_phone = phone[1:]
+        print("➡️ Phone number already has country code, formatted as:", formatted_phone)
+        
+    elif phone.startswith('91') or phone.startswith('1'):
+        # Already has country code without '+'
+        formatted_phone = phone
+        print("➡️ Phone number already has country code, formatted as:", formatted_phone)
+    else:
+        try:
+            # Add country code from org_id (assuming format_phone_number adds it)
+            formatted_phone = format_phone_number(org_id, phone)
+        except Exception as format_error:
+            raise HTTPException(status_code=400, detail=f"Invalid phone format: {str(format_error)}")
+
     last_exception = None
 
     async with httpx.AsyncClient() as client:
         for attempt in range(1, max_retries + 1):
             try:
-                logger.info(f"Send attempt {attempt}/{max_retries} to {phone_normalized}")
+                logger.info(f"Send attempt {attempt}/{max_retries} to {formatted_phone}")
 
                 response = await client.post(
                     f"{WHATSAPP_SERVICE_URL}/session/{session_id}/send",
-                    json={"to": phone_normalized, "text": text},
+                    json={"to": phone, "text": text},
                     timeout=30.0
                 )
 
                 # 4xx errors = don't retry
                 if 400 <= response.status_code < 500:
+                    if "Session not connected" in response.text:
+                        logger.warning("Session not connected. Retrying...")
+                        await asyncio.sleep(2)
+                        continue
                     logger.error(f"Client error {response.status_code}: {response.text}")
                     raise HTTPException(status_code=response.status_code, detail=response.text)
 
@@ -338,7 +356,7 @@ async def send_whatsapp(request: Request):
         org_id = body.get("org_id")
         phone = body.get("phone")
         text = body.get("message")
-
+        logger.info(f"Preparing to send message to {phone} for org_id {org_id}")
         if not org_id or not phone or not text:
             raise HTTPException(status_code=400, detail="org_id, phone, and message are required")
 
@@ -357,14 +375,32 @@ async def send_whatsapp(request: Request):
             raise HTTPException(status_code=400, detail=f"WhatsApp session is {status}, not connected")
 
         # Send message (with retries)
-        phone_normalized = normalize_phone(phone)
-        response_data = await send_to_whatsapp(session_id, phone_normalized, text)
+        if phone.startswith('+91') or phone.startswith('+1'):   # change needed here to check for 91 numbers without the +
+            # Remove the '+' sign as requested
+            formatted_phone = phone[1:]
+            print("➡️ Phone number already has country code, formatted as:", formatted_phone)
+            
+        elif phone.startswith('91') or phone.startswith('1'):
+            # Already has country code without '+'
+            formatted_phone = phone
+            print("➡️ Phone number already has country code, formatted as:", formatted_phone)
+        else:
+            try:
+                # Add country code from org_id (assuming format_phone_number adds it)
+                formatted_phone = format_phone_number(org_id, phone)
+            except Exception as format_error:
+                raise HTTPException(status_code=400, detail=f"Invalid phone format: {str(format_error)}")
+
+        response_data = await send_to_whatsapp(session_id, formatted_phone, text)
 
         # Store message
-        await store_message_async(session_id, phone_normalized, text, "res_owner", org_id)
-        update_contact_status(org_id, phone_normalized)
+        logger.info(f"Storing message for +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++__________________- {phone}")
+        
+        await store_message_async(session_id, phone, text, "res_owner", org_id)
+        logger.info(f"Message stored for {formatted_phone}")
+        update_contact_status(org_id, phone)
 
-        logger.info(f"Message sent to {phone_normalized}")
+        logger.info(f"Message sent to {formatted_phone} successfully")
         return {"success": True, "data": response_data}
 
     except HTTPException as he:
@@ -560,8 +596,6 @@ async def whatsapp_message(webhook: WhatsAppWebhook, background_tasks: Backgroun
         logger.warning(f"Could not extract phone from JID: {remote_jid}")
         return {"success": True}
 
-    phone_normalized = normalize_phone(phone)
-
     # Extract message
     message_obj = data.get("message", {})
     if isinstance(message_obj, dict):
@@ -575,24 +609,28 @@ async def whatsapp_message(webhook: WhatsAppWebhook, background_tasks: Backgroun
     sender = "res_owner" if is_from_me else "res_customer"
 
     logger.info(f"From: {sender} | Message: {message_text[:50]}...")
-
+    print("+++++++++++++++++++++++++++++++++++++++++++++++++++++++=++++++++++++++++++++++++++++++")
+    print("+++++++++++++++++++++++++++++++++++++++++++++++++++++++=++++++++++++++++++++++++++++++")
+    print("phone:", phone)
+    print("+++++++++++++++++++++++++++++++++++++++++++++++++++++++=++++++++++++++++++++++++++++++")
+    print("+++++++++++++++++++++++++++++++++++++++++++++++++++++++=++++++++++++++++++++++++++++++")
     # Check if conversation exists
     try:
         conv = supabase.table("conversations") \
             .select("message_list") \
             .eq("session_id", session_id) \
-            .eq("phone", phone_normalized) \
+            .eq("phone", phone) \
             .execute()
     except Exception as e:
         logger.error(f"DB error: {e}")
         return {"success": False, "error": "DB error"}
 
     if not conv.data:
-        logger.info(f"No conversation for {phone_normalized} — ignoring")
+        logger.info(f"No conversation for {phone} — ignoring")
         return {"success": True}
 
     # Store message and trigger AI
-    await store_message_async(session_id, phone_normalized, message_text, sender)
+    await store_message_async(session_id, phone, message_text, sender)
 
     async def handle_ai_followup():
         try:
@@ -601,7 +639,7 @@ async def whatsapp_message(webhook: WhatsAppWebhook, background_tasks: Backgroun
             result = supabase.table("conversations") \
                 .select("message_list") \
                 .eq("session_id", session_id) \
-                .eq("phone", phone_normalized) \
+                .eq("phone", phone) \
                 .execute()
 
             if not result.data:
@@ -609,17 +647,19 @@ async def whatsapp_message(webhook: WhatsAppWebhook, background_tasks: Backgroun
                 return
 
             message_list = result.data[0].get("message_list", [])
+            print("_________________________________here")
             restaurant_name, google_review_link = fetch_rest_detail(session_id)
-
+            print("_______________________________________________________rest")
             logger.info(f"Restaurant: {restaurant_name}")
-
+            logger.info(f"google_review_link: {google_review_link}")
+            print("google_review_link:", google_review_link)
             ai_message = await generate_followup_message(message_list, restaurant_name, google_review_link)
             formatted = format_whatsapp_message(ai_message)
 
             logger.info(f"Sending AI reply: {formatted[:50]}...")
-
-            await send_to_whatsapp(session_id, phone_normalized, formatted)
-            await store_message_async(session_id, phone_normalized, formatted, "res_owner")
+            
+            await send_to_whatsapp(session_id, phone, formatted)
+            await store_message_async(session_id, phone, formatted, "res_owner")
 
             await broadcast_to_org(session_id, {
                 "type": "new_message",

@@ -396,7 +396,7 @@ async def send_whatsapp(request: Request):
         # Store message
         logger.info(f"Storing message for +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++__________________- {phone}")
         
-        await store_message_async(session_id, phone, text, "res_owner", org_id)
+        await store_message_async(session_id, formatted_phone, text, "res_owner", org_id)
         logger.info(f"Message stored for {formatted_phone}")
         update_contact_status(org_id, phone)
 

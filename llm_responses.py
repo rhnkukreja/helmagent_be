@@ -112,6 +112,7 @@ async def extract_text_from_html(html_content: str) -> dict:
                               "items_ordered": [
                                 {"item_name": "<Item>", "quantity": "<Qty>", "price": "<Price>"}
                               ],
+                              "order_type: "<Dine-in/Takeaway/Delivery>",
                               "date": "<Bill date in ISO YYYY-MM-DD>",
                               "total_amount": "<Numeric Total>"
                             }
@@ -159,8 +160,17 @@ async def generate_followup_message(message_list, restaurant_name, google_review
             messages=[{"role": "user", "content": f"Is customer male/female? Respond: male/female/unknown\n\n{message_list}"}],
             max_completion_tokens=5,
         )
-        salutation = "Ma'am" if "female" in gender.choices[0].message.content.lower() else "Sir"
-        
+        classified_gender = gender.choices[0].message.content.lower()
+        print("classified gender:", classified_gender)
+
+        if "female" in classified_gender:
+            salutation = "Ma'am"
+        elif "male" in classified_gender:
+            salutation = "Sir"
+        else:
+            # If the response is 'unknown' or anything else not explicitly 'male' or 'female'
+            salutation = "Guest"
+        print("Using salutation:", salutation)
         # Generate response
         response = await client.chat.completions.create(
             model="gpt-4o-mini",
@@ -201,7 +211,11 @@ Use '{salutation}' only. No names. One message only.
         )
         
         ai_message = response.choices[0].message.content.strip()
-        print(f"\n✅ Message: {ai_message}\n" + "=" * 60 + "\n")
+        #print(f"\n✅ Message: {ai_message}\n" + "=" * 60 + "\n")
+        print("✅ Follow-up message generated successfully.")
+        print("=" * 60 + "\n")
+        print(ai_message)
+        print("=" * 60 + "\n")
         return ai_message
         
     except Exception as e:
@@ -212,26 +226,11 @@ Use '{salutation}' only. No names. One message only.
 
 
 if __name__=="__main__":
-    message_list=["""Hello Prateek Sir,
-
-Thank you so much for dining with us at Timshel on October 11, 2025! We hope you enjoyed our flavorful Kadhai Chicken, prepared with a blend of aromatic spices that truly brings out its essence, along with the comforting steam rice. 🍚
-
-We’d love to hear about your experience! Your feedback is invaluable to us as we strive to make every visit memorable.
-
-Looking forward to your thoughts!
-
-Warm regards,
-Timshel Team""",
-"Thank you",
-"""Thank you, Sir! We appreciate your feedback and would love to hear your thoughts on your experience. If you could take a moment to leave a review here: ABCD_link, it would mean a lot to us. 
-
-Here are two sample reviews you might consider:  
-1.) “The Kadhai Chicken was bursting with flavor and cooked to perfection! A must-try!”  
-2.) “The ambiance was delightful, and the steam rice complemented the dish wonderfully.”  
-
-Select any one number (Type 1 or 2), I will share that with you and you can copy paste.
+    message_list=["""
+Hello Dear Guest, \n\nThank you so much for choosing Himani for your delivery on November 6, 2025! We hope you enjoyed our delicious Garlic Naan and the rich flavors of our Kadhai Paneer and Dal Makhni. Our chef takes great pride in crafting these dishes with fresh ingredients and traditional spices. \n\nWe would love to hear your thoughts about your experience! Your feedback is invaluable to us and helps us serve you better in the future. \n\nLooking forward to your reply! \n\nWarm regards,  \nHimani Team ❤️
+  },
 """,
-"2"
+"Thanks i really loved the food!"
 ]
 
     restaurant_name="ABCD"

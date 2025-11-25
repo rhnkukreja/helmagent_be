@@ -71,7 +71,7 @@ def bulk_upsert_to_supabase(extracted_data_list: List[dict]) -> List[dict]:
     """Insert many bills in one request. Only fields that exist in the table."""
     try:
         ALLOWED_FIELDS = {
-            "name", "contact_number", "items_ordered", "bill_date",
+            "name", "contact_number", "items_ordered", "bill_date","order_type",
             "total_amount", "org_id"
         }
 
@@ -83,6 +83,8 @@ def bulk_upsert_to_supabase(extracted_data_list: List[dict]) -> List[dict]:
                     rec[field] = json.dumps(data.get(field, []))
                 elif field == "bill_date":
                     rec[field] = data.get("date") or data.get("bill_date")
+                elif field == "order_type":
+                    rec[field] = data.get("order_type") or ""
                 elif field == "total_amount":
                     val = data.get(field)
                     rec[field] = str(val) if val not in (None, "", 0) else None
@@ -437,10 +439,12 @@ async def get_bills(org_id: str):
         loop = asyncio.get_event_loop()
         response = await loop.run_in_executor(
             None,
-            lambda: supabase.table("bills").select("*").eq("org_id", org_id).order("id", desc=True).execute()
+            lambda: supabase.table("bills").select("*").eq("org_id", org_id).neq("contact_number", "").order("id", desc=True).execute()
         )
 
         bills = response.data or []
+        # 🔥 PRINT LENGTH OF BILLS FETCHED
+        print(f"📦 Bills fetched for org {org_id}: {len(bills)}")
 
         for bill in bills:
             bill_date = bill.get("bill_date")
@@ -513,7 +517,7 @@ class GenerateMessageRequest(BaseModel):
     items_ordered: str
     order_date: str
     total_amount: str
-
+    order_type: str
 
 @app.post("/generate-message")
 
@@ -524,7 +528,7 @@ async def generate_message(request: GenerateMessageRequest):
         print("🤖 GENERATING AI MESSAGE")
         print("="*60)
         rest_name = get_restaurant_name(request.org_id)
-
+        
         prompt = f"""
             You are a restaurant manager writing a personalized WhatsApp message to a customer after their visit.
             Restaurant Details:
@@ -533,6 +537,7 @@ async def generate_message(request: GenerateMessageRequest):
                     Customer Details:
             Name: {request.name}
             Order Date: {request.order_date}
+            Order Type: {request.order_type}
             Items Ordered: {request.items_ordered}
             Total Amount: ₹{request.total_amount}
 
@@ -544,6 +549,10 @@ async def generate_message(request: GenerateMessageRequest):
             Address the customer as:
             "{request.name} Sir" if the name sounds male
             "{request.name} Ma’am" if the name sounds female
+            If the {request.name} is "Unknown", "N/A", "Null", "None", "-", or empty, 
+            treat it as no name and address the customer as "Dear Guest". 
+            Never use these values as the person's name.
+
             "Dear Guest" if gender is uncertain(Always include greeting like “Hello” or “Dear”)
             Use a conversational yet polished tone with 1–2 emojis — not overly casual, not overly formal.
             Thank them sincerely for visiting and mention their order date naturally.
@@ -720,4 +729,4 @@ def head_root():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

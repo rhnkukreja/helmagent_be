@@ -23,10 +23,11 @@ def store_in_supabase(extracted_data: dict):
             "bill_date": extracted_data.get("date") or None,
             # store numeric total - if missing, store None/0.0 depending on your preference
             "total_amount": extracted_data.get("total_amount", ""), 
+            "order_type": extracted_data.get("order_type", ""),
             # keep org_id if present
             "org_id": extracted_data.get("org_id", None),
         }
-
+        print("Record to insert:", record)
         response = supabase.table("bills").insert(record).execute()
 
         if response.data:

@@ -167,21 +167,43 @@ async def store_message_async(session_id: str, phone: str, message: str, sender:
     return await loop.run_in_executor(None, store_message_sync, session_id, phone, message, sender, org_id)
 
 def fetch_customer_details(org_id: str, phone: str):
-    """Fetch customer details from bills table"""
+    """Fetch customer details checking various phone number formats"""
     try:
-        
         logger.info(f"Fetching customer details for phone: {phone}, org_id: {org_id}")
+        print("\n" + "+" * 60)
+        # 1. Clean the input phone number
+        # Remove any non-numeric characters (like + or spaces) temporarily
+        digits_only = ''.join(filter(str.isdigit, str(phone)))
         
+        # 2. Generate variations (Assuming Indian 10-digit standard based on your '91' example)
+        # We assume the last 10 digits are the "base" number.
+        base_number = digits_only[-10:] 
+        print("\n" + "-" * 60)
+        possible_numbers = [
+            base_number,             # 1234567890 (What you likely have in DB)
+            f"91{base_number}",      # 911234567890
+            f"+91{base_number}"      # +911234567890
+        ]
+        
+        # Add the original raw input just in case
+        if phone not in possible_numbers:
+            possible_numbers.append(phone)
+
+        logger.info(f"Checking for any of these numbers: {possible_numbers}")
+
+        # 3. Use .in_() to check ALL formats in ONE database call
         res = (
             supabase.table("bills")
             .select("name, bill_date, total_amount")
             .eq("org_id", org_id)
-            .eq("contact_number", phone)
+            .in_("contact_number", possible_numbers) # <--- This handles the multiple checks
             .order("bill_date", desc=True)
             .limit(1)
             .execute()
         )
-
+        print("+" * 60 + "\n")
+        print("Supabase response:", res.data)
+        print("+" * 60 + "\n")
         if res.data and len(res.data) > 0:
             customer = res.data[0]
             name = customer.get("name")
@@ -195,7 +217,7 @@ def fetch_customer_details(org_id: str, phone: str):
                 "bill_amount": str(bill_amount) if bill_amount else None,
             }
 
-        logger.warning(f"No bill found for {phone} in org {org_id}")
+        logger.warning(f"No bill found for {phone} (checked variations) in org {org_id}")
         return None
 
     except Exception as e:
@@ -391,8 +413,8 @@ async def send_whatsapp(request: Request):
             except Exception as format_error:
                 raise HTTPException(status_code=400, detail=f"Invalid phone format: {str(format_error)}")
 
-        response_data = await send_to_whatsapp(session_id, formatted_phone, text)
-
+        # response_data = await send_to_whatsapp(session_id, formatted_phone, text)
+        response_data = {"message_id": str(uuid.uuid4()), "status": "sent"}  # Mocked for testing
         # Store message
         logger.info(f"Storing message for +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++__________________- {phone}")
         

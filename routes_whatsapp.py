@@ -413,8 +413,8 @@ async def send_whatsapp(request: Request):
             except Exception as format_error:
                 raise HTTPException(status_code=400, detail=f"Invalid phone format: {str(format_error)}")
 
-        # response_data = await send_to_whatsapp(session_id, formatted_phone, text)
-        response_data = {"message_id": str(uuid.uuid4()), "status": "sent"}  # Mocked for testing
+        response_data = await send_to_whatsapp(session_id, formatted_phone, text)
+        #response_data = {"message_id": str(uuid.uuid4()), "status": "sent"}  # Mocked for testing
         # Store message
         logger.info(f"Storing message for +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++__________________- {phone}")
         

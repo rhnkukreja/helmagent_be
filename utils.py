@@ -2,11 +2,22 @@ import os
 import json
 from supabase import create_client, Client
 from dotenv import load_dotenv
+import httpx
+import base64
+import logging
+import asyncio
 from fastapi import HTTPException
 load_dotenv()
 
 SUPABASE_KEY=os.getenv("SUPABASE_SERVICE_KEY")
 SUPABASE_URL=os.getenv("SUPABASE_URL")
+WHATSAPP_SERVICE_URL=os.getenv("WHATSAPP_SERVICE_URL")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 supabase: Client = create_client(SUPABASE_URL,SUPABASE_KEY)
 def store_in_supabase(extracted_data: dict):
@@ -120,6 +131,94 @@ def fetch_rest_detail(org_id: str):
     except Exception as e:
         print(f"❌ Error fetching restaurant details: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Supabase error: {str(e)}")
+
+
+def safe_parse_items(items_raw):
+    """
+    Accepts ANY form of items_ordered:
+    - JSONB array (list)
+    - Raw JSON string
+    - Escaped JSON string
+    - Bad string
+    - None
+    Returns a LIST always.
+    """
+    # Case 1: Already JSONB (list)
+    if isinstance(items_raw, list):
+        return items_raw
+
+    # Case 2: None or empty string
+    if not items_raw:
+        return []
+
+    # Case 3: Stored as STRING (escaped or normal)
+    if isinstance(items_raw, str):
+        try:
+            # First try direct json.loads
+            return json.loads(items_raw)
+        except:
+            try:
+                # Try unescaping then parsing
+                unescaped = items_raw.encode('utf-8').decode('unicode_escape')
+                return json.loads(unescaped)
+            except:
+                return []
+
+    # Default fallback
+    return []
+
+# converting image to base 64 
+async def url_to_base64(url: str) -> str:
+    async with httpx.AsyncClient() as client:
+        res = await client.get(url)
+        res.raise_for_status()
+
+    encoded = base64.b64encode(res.content).decode("utf-8")
+    return f"data:image/jpeg;base64,{encoded}"
+
+
+async def send_promo_message(session_id: str, phone: str, text: str, image_url: str, max_retries: int = 3):
+
+# Sends an IMAGE + CAPTION WhatsApp message with retry logic.
+
+    last_exception = None
+    base64_img = await url_to_base64(image_url)
+
+    async with httpx.AsyncClient() as client:
+        for attempt in range(1, max_retries + 1):
+            try:
+                logger.info(f"[IMAGE] Attempt {attempt}/{max_retries} → {phone}")
+
+                response = await client.post(
+                    f"{WHATSAPP_SERVICE_URL}/session/{session_id}/send-media",
+                    json={
+                        "to": phone,
+                        "media": base64_img,
+                        "caption": text
+                    },
+                    timeout=40.0
+                )
+
+                if 400 <= response.status_code < 500:
+                    if "Session not connected" in response.text:
+                        logger.warning("Session disconnected. Retrying…")
+                        await asyncio.sleep(2)
+                        continue
+
+                    raise HTTPException(status_code=response.status_code, detail=response.text)
+
+                response.raise_for_status()
+                logger.info(f"📸 Image message sent to {phone}")
+                return response.json()
+
+            except Exception as e:
+                last_exception = e
+                logger.warning(f"[IMAGE] Failed on attempt {attempt}: {str(e)}")
+
+                if attempt < max_retries:
+                    await asyncio.sleep(2)
+
+    raise HTTPException(status_code=504, detail=f"Failed to send image message: {str(last_exception)}")
 
 if __name__ == "__main__":
     # Test the functions here if needed

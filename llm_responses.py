@@ -1,5 +1,6 @@
 import os
 import json
+import ast
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 from fastapi import HTTPException
@@ -221,6 +222,168 @@ Use '{salutation}' only. No names. One message only.
     except Exception as e:
         print(f"❌ Error: {str(e)}")
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
+
+async def generate_flux_prompt(raw_dict: dict) -> str:
+    system_prompt = (
+        "Rewrite restaurant promotional data into a professional banner prompt. "
+        "The output must force the image model to create a promotional poster layout, "
+        "not a plain food photo. "
+        "Rules: Include only very short text such as the title and discount. "
+        "Specify placement: title at top, price at bottom. "
+        "Never include long sentences or descriptions as text. "
+        "Include these words exactly as short text elements."
+    )
+
+    user_prompt = (
+        f"Raw Data: {raw_dict}\n"
+        "Generate a 2-line promotional poster prompt with layout instructions."
+    )
+
+    try:
+        response = await client.responses.create(
+            model="gpt-4.1-mini",
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ]
+        )
+
+        # Extract the LLM output correctly
+        output = response.output[0].content[0].text
+        print("LLM OUTPUT:", output)
+
+        return output.strip()
+
+    except Exception as e:
+        print("LLM ERROR:", e)
+        return f"ERROR generating banner prompt: {str(e)}"
+
+
+
+
+async def generate_offer_message(
+    customer: dict,
+    insights: dict,
+    active_offers: list[dict],
+) -> tuple[str, dict]:
+    """Send active offers + customer data to LLM and let it decide. 
+    If no match found → fallback to Flat 10% OFF."""
+    
+    try:
+        print("entered generate_offer_message")
+
+        # SAFETY: If no active offers from DB → fallback directly
+        if not active_offers:
+            fallback_offer = {
+                "title": "Flat 10% OFF",
+                "description": "Get 10% OFF on your next order — today only!"
+            }
+            return (
+                "Hey! 🎉 Enjoy a flat 10% OFF on your next order. Valid today only!",
+                fallback_offer
+            )
+
+        # 1. BUILD PROMPT
+        prompt = f"""
+        You are a restaurant marketing assistant.
+
+        Your job:
+        - Analyse the customer data below.
+        - Select EXACTLY ONE offer from the list of ACTIVE_OFFERS.
+        - If none logically match the customer's ordering behaviour, choose `"fallback"`.
+
+        CUSTOMER:
+        - Name: {customer.get("name")}
+        - Most Ordered Item: {insights.get("most_ordered_item")}
+        - Latest Ordered Item: {insights.get("latest_item")}
+
+        ACTIVE_OFFERS (JSON list):
+        {active_offers}
+
+        RULES FOR OFFER SELECTION:
+            - The offer MUST come from ACTIVE_OFFERS only.
+            - Match based on relevance to items ordered or customer patterns.
+            - If NO offer matches, respond with: fallback
+            - Respond with ONLY one of these:
+            - The exact offer JSON object (MUST USE DOUBLE QUOTES key="value")
+            - The word: fallback
+
+        Now respond with ONLY the selected offer (JSON or "fallback"), nothing else.
+        """
+
+        # 2. LLM CALL TO SELECT THE OFFER
+        offer_choice = await client.chat.completions.create(
+            model="gpt-5-nano",
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        raw_offer = offer_choice.choices[0].message.content.strip()
+        print("++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
+        print(raw_offer)    
+        print("++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
+        # 3. HANDLE FALLBACK OFFER
+        if raw_offer.lower() == "fallback":
+            selected_offer = {
+                "title": "Flat 10% OFF",
+                "description": "Get 10% OFF on your next order — today only!"
+            }
+        else:   
+            try:
+                selected_offer = json.loads(raw_offer)
+            except json.JSONDecodeError:
+                try:
+                    # FALLBACK TRY: Parse as Python Dictionary (Single quotes)
+                    # This fixes the specific error you are seeing in logs
+                    selected_offer = ast.literal_eval(raw_offer)
+                except Exception as e:
+                    print(f"❌ Parsing Error: {e} | Raw: {raw_offer}")
+                    # Final safety fallback
+                    selected_offer = {
+                        "title": "Flat 10% OFF",
+                        "description": "Get 10% OFF on your next order — today only!"
+                    }
+
+        # 4. BUILD FINAL MESSAGE PROMPT
+        message_prompt = f"""
+        Create a short WhatsApp promotional message.
+
+        CUSTOMER:
+        - Name: {customer.get("name")}
+
+        OFFER TO PROMOTE:
+        {selected_offer}
+
+        RULES:
+        - 2–3 lines max
+        - Friendly WhatsApp style
+        - use the desc of the offer to create a catchy message 
+        - give the code  that may be in the selected offer
+        - Max 1–2 emojis
+        - Add urgency (“today only”, “limited time”)
+        - Return ONLY the message text.
+        """
+
+        llm_response = await client.chat.completions.create(
+            model="gpt-5-nano",
+            messages=[{"role": "user", "content": message_prompt}],
+        )
+
+        final_message = llm_response.choices[0].message.content.strip()
+        return final_message, selected_offer
+
+    except Exception as e:
+        print("LLM Error:", e)
+        fallback_offer = {
+            "title": "Flat 10% OFF",
+            "description": "Get 10% OFF on your next order — today only!"
+        }
+        return "⚠️ Unable to generate message right now. Please try again.", fallback_offer
+
+
+
+
+
+
 
 
 

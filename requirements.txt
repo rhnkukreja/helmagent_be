@@ -11,3 +11,4 @@ pydantic
 aiofiles
 psutil
 razorpay
+fal_client

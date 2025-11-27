@@ -26,6 +26,8 @@ from llm_responses import extract_text_from_image, extract_text_from_html
 from utils import store_in_supabase
 from routes_whatsapp import router as whatsapp_router
 from routes_razorpay import router as razorpay_router
+from routes_marketing import router as marketing_router
+from routes_fal import router as fal_router
 from memory_logger import log_memory_usage_to_file
 
 # -------------------------------------------------------
@@ -54,7 +56,8 @@ app.add_middleware(
 )
 app.include_router(whatsapp_router)
 app.include_router(razorpay_router)
-
+app.include_router(marketing_router)
+app.include_router(fal_router)
 # ---------- QUEUE & WORKERS ----------
 processing_queue: asyncio.Queue = asyncio.Queue()
 # NUM_WORKERS = int(os.getenv("NUM_WORKERS", "5"))

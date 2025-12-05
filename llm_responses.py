@@ -1,14 +1,16 @@
 import os
 import json
 import ast
+import base64
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 
-
+import google.generativeai as genai
 load_dotenv()
-
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+genai.configure(api_key=GOOGLE_API_KEY)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
@@ -43,12 +45,14 @@ async def extract_text_from_image(image_base64: str) -> dict:
                                 {"item_name": "<Item>", "quantity": "<Qty>", "price": "<Price>"}
                             ],
                             "date": "<Bill date in ISO YYYY-MM-DD>",
+                            "time": "<HH:MM in 24-hour format>",
                             "total_amount": "<Numeric Total>"
                             }
 
                             ⚠️ Important rules:
                             - Ignore restaurant or merchant names, phone numbers, GST numbers, invoice numbers, and cashier names.
                             - Only extract the *customer's* name and phone number if explicitly shown (like “Customer Name”, “Bill To”, or “Contact No”).
+                            - Extract both date AND time even if they appear together like "27/11/25 18:58".
                             - If no customer name or contact number is present, leave those fields empty.
                             - If there is any currency symbol (₹, $, etc.) in prices, dont remove it — keep it as is.
                             - Always include `items_ordered`, `date`, and `total_amount` if visible.
@@ -115,6 +119,7 @@ async def extract_text_from_html(html_content: str) -> dict:
                               ],
                               "order_type: "<Dine-in/Takeaway/Delivery>",
                               "date": "<Bill date in ISO YYYY-MM-DD>",
+                              "time": "<HH:MM in 24-hour format>",
                               "total_amount": "<Numeric Total>"
                             }
 
@@ -122,6 +127,7 @@ async def extract_text_from_html(html_content: str) -> dict:
                             - Ignore restaurant info, GST, invoice no., and cashier name.
                             - Focus only on customer details, items, date, and total.
                             - If there is any currency symbol (₹, $, etc.) in prices, dont remove it — keep it as is.
+                            - Extract both date AND time even if they appear together like "27/11/25 18:58".
                             - If any field is missing, leave it blank or empty.
                             - Output ONLY pure JSON (no markdown, no commentary)."""
                         },
@@ -145,7 +151,68 @@ async def extract_text_from_html(html_content: str) -> dict:
         print("❌ Error extracting text from HTML:", str(e))
         raise HTTPException(status_code=500, detail=f"GPT-4 HTML extraction error: {str(e)}")
 
+async def extract_hotel_log_data(image_base64: str) -> dict:
+    """
+    Uses Gemini 1.5 Pro to read handwriting AND format it as JSON in one go.
+    No Service Account JSON required.
+    """
+    try:
+        print("👀 Sending image to Gemini 1.5 Pro for OCR...")
+        
+        # 1. Setup the Model
+        # "gemini-1.5-pro" is the best version for complex handwriting
+        model = genai.GenerativeModel('gemini-2.5-pro')
 
+        # 2. Decode Image
+        image_bytes = base64.b64decode(image_base64)
+        
+        # 3. Create the Prompt
+        # We give it the image AND the instructions together
+        prompt = """
+        Analyze this handwritten hotel logbook image.
+        Extract all guest entries into a strict JSON format.
+
+        Rules:
+        - Read the handwritten rows carefully.
+        - If a value is missing or illegible, use "".
+        - Do not hallucinate data.
+        - Return ONLY JSON.
+
+        Output Format:
+        {
+            "rows": [
+                {
+                    "name": "Guest Name",
+                    "contact_number": "Phone Number",
+                    "room_number": "Room Number",
+                    "date_of_visit": "YYYY-MM-DD",
+                    "hometown": "City/Location",
+                    "nights_stayed": "Number",
+                    "misc_data": { "raw_text": "any extra notes" }
+                }
+            ]
+        }
+        """
+
+        # 4. Generate Content (Image + Text)
+        response = model.generate_content(
+            [
+                {'mime_type': 'image/jpeg', 'data': image_bytes}, 
+                prompt
+            ],
+            generation_config={"response_mime_type": "application/json"}
+        )
+
+        # 5. Parse Result
+        print("✅ Gemini finished reading.")
+        result = json.loads(response.text)
+        print(result)
+        return result
+
+    except Exception as e:
+        print(f"❌ Gemini OCR Error: {str(e)}")
+        # Return empty structure on error so app doesn't crash
+        return {"rows": [], "error": str(e)}
 # ============================================================
 # 💬 Generate WhatsApp Follow-up Message (Async)
 # ============================================================

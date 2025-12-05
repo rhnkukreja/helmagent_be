@@ -22,12 +22,13 @@ from dotenv import load_dotenv
 import httpx
 import requests
 
-from llm_responses import extract_text_from_image, extract_text_from_html
-from utils import store_in_supabase
+from llm_responses import extract_text_from_image, extract_text_from_html, extract_hotel_log_data
+from utils import store_in_supabase, store_hotel_guest_in_supabase
 from routes_whatsapp import router as whatsapp_router
 from routes_razorpay import router as razorpay_router
 from routes_marketing import router as marketing_router
 from routes_fal import router as fal_router
+from routes_analytics import router as analytics_router
 from memory_logger import log_memory_usage_to_file
 
 # -------------------------------------------------------
@@ -36,7 +37,7 @@ print("Script started running...")
 
 # ---------- CONFIG ----------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_KEY")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 BACKEND_URL = os.getenv("BACKEND_URL")
 
@@ -58,6 +59,7 @@ app.include_router(whatsapp_router)
 app.include_router(razorpay_router)
 app.include_router(marketing_router)
 app.include_router(fal_router)
+app.include_router(analytics_router)
 # ---------- QUEUE & WORKERS ----------
 processing_queue: asyncio.Queue = asyncio.Queue()
 # NUM_WORKERS = int(os.getenv("NUM_WORKERS", "5"))
@@ -74,7 +76,7 @@ def bulk_upsert_to_supabase(extracted_data_list: List[dict]) -> List[dict]:
     """Insert many bills in one request. Only fields that exist in the table."""
     try:
         ALLOWED_FIELDS = {
-            "name", "contact_number", "items_ordered", "bill_date","order_type",
+            "name", "contact_number", "items_ordered", "bill_date", "bill_time", "order_type",
             "total_amount", "org_id"
         }
 
@@ -88,6 +90,8 @@ def bulk_upsert_to_supabase(extracted_data_list: List[dict]) -> List[dict]:
                     rec[field] = data.get("date") or data.get("bill_date")
                 elif field == "order_type":
                     rec[field] = data.get("order_type") or ""
+                elif field == "bill_time":
+                    rec[field] = data.get("time") or data.get("bill_time") or ""
                 elif field == "total_amount":
                     val = data.get(field)
                     rec[field] = str(val) if val not in (None, "", 0) else None
@@ -221,8 +225,107 @@ async def process_sub_job(sub_job: dict):
 
 # -------------------------------------------------------
 # ---------- ENDPOINTS ----------
-@app.post("/process-bill/")
+@app.post("/process-hotel-log")
+async def process_hotel_log(
+    file: UploadFile = File(...),
+    org_id: str = Form(...)
+):
+    try:
+        filename = file.filename.lower()
+        
+        # ==========================================
+        # 📦 CASE 1: ZIP FILE UPLOAD (Batch Processing)
+        # ==========================================
+        if filename.endswith(".zip"):
+            print(f"[HOTEL LOG] Processing ZIP file: {filename}")
+            
+            # 1. Setup Temp Directory
+            temp_dir = tempfile.mkdtemp()
+            zip_path = os.path.join(temp_dir, "upload.zip")
+            
+            with open(zip_path, "wb") as f:
+                shutil.copyfileobj(file.file, f)
+            
+            # 2. Extract Valid Images
+            supported_files = []
+            with zipfile.ZipFile(zip_path, "r") as z:
+                for info in z.infolist():
+                    if info.is_dir() or info.filename.startswith("__MACOSX"):
+                        continue
+                    
+                    ext = os.path.splitext(info.filename)[1].lower()
+                    if ext in [".jpg", ".jpeg", ".png", ".webp"]:
+                        # Extract immediately to get the path
+                        path = z.extract(info, temp_dir)
+                        supported_files.append(path)
+            
+            total_files = len(supported_files)
+            if total_files == 0:
+                shutil.rmtree(temp_dir)
+                return {"success": False, "error": "No valid images found in ZIP"}
 
+            print(f"[HOTEL LOG] Found {total_files} images. Starting batch processing...")
+
+            # 3. Helper for Single Image Processing
+            async def process_single_hotel_image(path):
+                try:
+                    with open(path, "rb") as img_f:
+                        encoded_img = base64.b64encode(img_f.read()).decode()
+                    
+                    # AI Extraction
+                    extracted_data = await extract_hotel_log_data(encoded_img)
+                    extracted_data["org_id"] = org_id
+                    
+                    # Store in DB
+                    saved_data = store_hotel_guest_in_supabase(extracted_data)
+                    return {"status": "success", "data": saved_data}
+                except Exception as e:
+                    return {"status": "error", "error": str(e), "file": os.path.basename(path)}
+
+            # 4. PROCESS IN CHUNKS (Like process-bill)
+            CHUNK_SIZE = 50 # Adjust based on server capacity
+            results = []
+            
+            for i in range(0, total_files, CHUNK_SIZE):
+                chunk = supported_files[i : i + CHUNK_SIZE]
+                print(f"[HOTEL LOG] Processing chunk {i} to {i + len(chunk)}...")
+                
+                # Run this chunk in parallel
+                tasks = [process_single_hotel_image(p) for p in chunk]
+                chunk_results = await asyncio.gather(*tasks)
+                results.extend(chunk_results)
+
+            # 5. Cleanup
+            shutil.rmtree(temp_dir)
+            
+            # 6. Summary
+            success_count = sum(1 for r in results if r["status"] == "success")
+            return {
+                "success": True, 
+                "message": f"Processed {success_count}/{total_files} images successfully.",
+                "details": results
+            }
+
+        # ==========================================
+        # 🖼️ CASE 2: SINGLE IMAGE UPLOAD
+        # ==========================================
+        else:
+            image_bytes = await file.read()
+            encoded = base64.b64encode(image_bytes).decode()
+
+            extracted = await extract_hotel_log_data(encoded)
+            extracted["org_id"] = org_id
+
+            saved = store_hotel_guest_in_supabase(extracted)
+
+            return {"success": True, "data": saved}
+
+    except Exception as e:
+        print(f"❌ Hotel Log Error: {e}")
+        traceback.print_exc()
+        return {"success": False, "error": str(e)}
+
+@app.post("/process-bill")
 async def process_bill(
     files: List[UploadFile] = File(...),
     org_id: str = Form(...),
@@ -379,13 +482,13 @@ async def get_queue_status(job_id: str):
 
     return info
 
-
 @app.get("/dashboard/{org_id}")
-
 async def get_dashboard_data(org_id: str):
     """Fetch dashboard data from Supabase."""
     try:
         loop = asyncio.get_event_loop()
+        
+        # 1. Fetch Organization Details
         org_response = await loop.run_in_executor(
             None,
             lambda: supabase.table("organizations").select("*").eq("org_id", str(org_id)).execute()
@@ -393,35 +496,54 @@ async def get_dashboard_data(org_id: str):
 
         org = org_response.data[0] if org_response.data else None
 
+        # Default values if org is missing (Safety check)
         if not org:
             org = {
-                "name": "Unnamed Restaurant",
-                "owner_name": "Owner Not Set",
+                "name": "Unnamed Business",
+                "owner_name": "Owner",
                 "phone": "N/A",
                 "total_reviews": 0,
                 "active_conversations": 0,
                 "open_issues": 0,
                 "avg_rating": 0.0,
+                "business_type": "restaurant", # Default fallback
             }
 
+        # 2. Fetch Recent Activities
         activities_response = await loop.run_in_executor(
             None,
             lambda: supabase.table("activities").select("*").eq("org_id", org_id).order("created_at", desc=True).limit(10).execute()
         )
         activities = activities_response.data or []
 
+        # 3. Construct Response
+        # Note: We explicitly cast avg_rating to float to avoid Decimal serialization errors
         dashboard_data = {
             "organization": {
                 "name": org.get("name"),
                 "owner_name": org.get("owner_name"),
                 "phone": org.get("phone"),
+                "business_type": org.get("business_type"), # ✅ CRITICAL ADDITION
                 "avg_rating": float(org.get("avg_rating", 0.0)) if org.get("avg_rating") else 0.0,
             },
             "todayStats": {
-                "reviews": {"count": org.get("total_reviews", 0), "change": "+0 today", "positive": True},
-                "conversations": {"count": org.get("active_conversations", 0), "activeNow": 0},
-                "issues": {"count": org.get("open_issues", 0), "label": "open issues"},
-                "rating": {"value": float(org.get("avg_rating", 0.0)) if org.get("avg_rating") else 0.0, "change": "No change"},
+                "reviews": {
+                    "count": org.get("total_reviews", 0), 
+                    "change": "+0 today", 
+                    "positive": True
+                },
+                "conversations": {
+                    "count": org.get("active_conversations", 0), 
+                    "activeNow": 0
+                },
+                "issues": {
+                    "count": org.get("open_issues", 0), 
+                    "label": "open issues"
+                },
+                "rating": {
+                    "value": float(org.get("avg_rating", 0.0)) if org.get("avg_rating") else 0.0, 
+                    "change": "No change"
+                },
             },
             "activities": activities,
         }
@@ -433,40 +555,122 @@ async def get_dashboard_data(org_id: str):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.get("/bills/{org_id}")
-
 async def get_bills(org_id: str):
-    """Fetch bills from Supabase."""
+    """Unified endpoint: Returns restaurant bills OR hotel guest data based on business_type"""
     try:
-        loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: supabase.table("bills").select("*").eq("org_id", org_id).neq("contact_number", "").order("id", desc=True).execute()
+        # 1. Determine business type
+        org_response = (
+            supabase.table("organizations")
+            .select("business_type")
+            .eq("org_id", org_id)
+            .single()
+            .execute()
         )
 
-        bills = response.data or []
-        # 🔥 PRINT LENGTH OF BILLS FETCHED
-        print(f"📦 Bills fetched for org {org_id}: {len(bills)}")
+        business_type = (
+            org_response.data["business_type"] if org_response.data else None
+        ) or "restaurant"
 
-        for bill in bills:
-            bill_date = bill.get("bill_date")
-            if bill_date:
-                try:
-                    formatted = datetime.strptime(bill_date, "%Y-%m-%d").strftime("%b %d, %Y")
-                    bill["order_date"] = formatted
-                except Exception:
-                    bill["order_date"] = bill_date
-            else:
-                bill["order_date"] = "—"
+        # ====================================================
+        # HOTEL LOGIC
+        # ====================================================
+        if business_type == "hotel":
+            response = (
+                supabase.table("hotel_bills")
+                .select("*")
+                .eq("org_id", org_id)
+                .order("date_of_visit", desc=True)
+                .execute()
+            )
 
-            bill["total_amount"] = str(bill.get("total_amount") or "")
+            guests = response.data or []
+            print(f"Hotel guests fetched for org {org_id}: {len(guests)}")
 
-        return {"success": True, "data": bills}
+            result = []
+
+            for g in guests:
+                # -----------------------------
+                # Handle misc_data safely
+                # -----------------------------
+                raw_misc = g.get("misc_data")
+                parsed_misc = {}
+
+                if isinstance(raw_misc, dict):
+                    parsed_misc = raw_misc
+                elif isinstance(raw_misc, str):
+                    try:
+                        parsed_misc = json.loads(raw_misc)
+                    except:
+                        parsed_misc = {}
+
+                # -----------------------------
+                # Use NEW contact_number column (best practice)
+                # Fallback to misc_data.phone if missing
+                # -----------------------------
+                contact_number = (
+                    g.get("contact_number")
+                    or parsed_misc.get("phone")
+                    or ""
+                )
+
+                # -----------------------------
+                # Transform hotel bill entry
+                # -----------------------------
+                result.append({
+                    "id": g.get("id"),
+                    "name": g.get("name") or "Guest",
+                    "contact_number": contact_number,
+                    "phone": contact_number or "N/A",
+                    "order_date": g.get("date_of_visit") or "—",
+                    "total_amount": "",
+                    "room_number": g.get("room_number") or "—",
+                    "hometown": g.get("arrived_from") or "—",
+                    "nights_stayed": g.get("number_of_nights_stayed") or 0,
+                    "misc_data": parsed_misc,
+                })
+
+            return {"success": True, "data": result}
+
+        # ====================================================
+        # RESTAURANT LOGIC
+        # ====================================================
+        else:
+            response = (
+                supabase.table("bills")
+                .select("*")
+                .eq("org_id", org_id)
+                .neq("contact_number", "")
+                .order("id", desc=True)
+                .execute()
+            )
+
+            bills = response.data or []
+            print(f"Restaurant bills fetched for org {org_id}: {len(bills)}")
+
+            for bill in bills:
+                bill_date = bill.get("bill_date")
+
+                # Format date
+                if bill_date:
+                    try:
+                        formatted = datetime.strptime(
+                            str(bill_date), "%Y-%m-%d"
+                        ).strftime("%b %d, %Y")
+                        bill["order_date"] = formatted
+                    except:
+                        bill["order_date"] = str(bill_date)
+                else:
+                    bill["order_date"] = "—"
+
+                bill["total_amount"] = str(bill.get("total_amount") or "")
+
+            return {"success": True, "data": bills}
 
     except Exception as e:
-        print(f"❌ Error fetching bills: {e}")
+        print(f"Error in /bills/{org_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 
 @app.get("/whatsapp/status/{org_id}")

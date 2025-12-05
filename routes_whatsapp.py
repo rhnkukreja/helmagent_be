@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 
 from supabase import create_client, Client
 from llm_responses import generate_followup_message
-from utils import update_contact_status, format_phone_number, fetch_rest_detail
+from utils import update_contact_status, format_phone_number, fetch_rest_detail, normalize_phone_number
 
 # ============= LOGGING =============
 logging.basicConfig(
@@ -50,8 +50,10 @@ class WhatsAppWebhook(BaseModel):
     data: dict
 
 # ============= HELPERS =============
+
+"""
 def normalize_phone(phone: str) -> str:
-    """Normalize phone to: 919999000001 (no +, no spaces)"""
+    #Normalize phone to: 919999000001 (no +, no spaces)
     if not phone:
         return ""
     digits = ''.join(c for c in str(phone) if c.isdigit())
@@ -59,6 +61,7 @@ def normalize_phone(phone: str) -> str:
     if len(digits) == 10:
         digits = '91' + digits
     return digits
+"""
 
 async def broadcast_to_org(org_id: str, message: dict):
     """Send message ONLY to WebSocket clients of a specific org_id"""
@@ -377,6 +380,7 @@ async def send_whatsapp(request: Request):
 
         org_id = body.get("org_id")
         phone = body.get("phone")
+        phone = normalize_phone_number(phone)
         text = body.get("message")
         logger.info(f"Preparing to send message to {phone} for org_id {org_id}")
         if not org_id or not phone or not text:
@@ -413,8 +417,8 @@ async def send_whatsapp(request: Request):
             except Exception as format_error:
                 raise HTTPException(status_code=400, detail=f"Invalid phone format: {str(format_error)}")
 
-        #response_data = await send_to_whatsapp(session_id, formatted_phone, text)
-        response_data = {"message_id": str(uuid.uuid4()), "status": "sent"}  # Mocked for testing
+        response_data = await send_to_whatsapp(session_id, formatted_phone, text)
+        #response_data = {"message_id": str(uuid.uuid4()), "status": "sent"}  # Mocked for testing
         # Store message
         logger.info(f"Storing message for +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++__________________- {phone}")
         

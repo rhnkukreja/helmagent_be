@@ -1,5 +1,6 @@
 import os 
 import json
+import re
 from supabase import create_client, Client
 from dotenv import load_dotenv
 import httpx
@@ -20,6 +21,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 supabase: Client = create_client(SUPABASE_URL,SUPABASE_KEY)
+
+def normalize_phone_number(phone: str) -> str:  
+    normalized = re.sub(r'\D', '', phone)
+    return normalized
+
 def store_in_supabase(extracted_data: dict):
     """
     Stores extracted data into the Supabase table, now with bill_date and total_amount.
@@ -32,6 +38,7 @@ def store_in_supabase(extracted_data: dict):
             "items_ordered": extracted_data.get("items_ordered", []),
             # expect date as 'YYYY-MM-DD' or empty string
             "bill_date": extracted_data.get("date") or None,
+            "bill_time": extracted_data.get("time") or None,
             # store numeric total - if missing, store None/0.0 depending on your preference
             "total_amount": extracted_data.get("total_amount", ""), 
             "order_type": extracted_data.get("order_type", ""),
@@ -219,6 +226,52 @@ async def send_promo_message(session_id: str, phone: str, text: str, image_url: 
                     await asyncio.sleep(2)
 
     raise HTTPException(status_code=504, detail=f"Failed to send image message: {str(last_exception)}")
+
+def store_hotel_guest_in_supabase(data: dict):
+    """
+    Save ALL rows extracted from hotel OCR result into Supabase.
+    Expects:
+    {
+        "rows": [
+            { ... guest 1 ... },
+            { ... guest 2 ... },
+            ...
+        ]
+    }
+    """
+
+    try:
+        rows = data.get("rows", [])
+        org_id = data.get("org_id")
+
+        if not rows:
+            raise HTTPException(status_code=400, detail="No rows extracted from hotel log")
+
+        records = []
+
+        for row in rows:
+            record = {
+                "name": row.get("name", ""),
+                "contact_number": row.get("contact_number", ""), 
+                "room_number": row.get("room_number", ""),
+                "date_of_visit": row.get("date_of_visit") or None,
+                "hometown": row.get("hometown", ""),
+                "number_of_nights_stayed": row.get("nights_stayed") or None,
+                "misc_data": row.get("misc_data", {}),
+                "org_id": org_id
+            }
+            records.append(record)
+
+        # Bulk insert
+        res = supabase.table("hotel_bills").insert(records).execute()
+
+        return res.data
+
+    except Exception as e:
+        print("❌ Supabase insert error:", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 
 if __name__ == "__main__":
     # Test the functions here if needed

@@ -12,3 +12,5 @@ aiofiles
 psutil
 razorpay
 fal_client
+pandas
+google-generativeai
